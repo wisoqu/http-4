@@ -11,10 +11,10 @@
 //   ship a table v2 without breaking anything.
 //
 // ENCODING (per field):
-//   1xxxxxxx  exact (name,value) static match      → 1 byte total
-//   01xxxxxx  name in static table, literal value  → 1 + len + value
-//   00xxxxxx  literal name + literal value
-//   value strings use a 2-bit "prefix of a known value" trick: if the value
+//   1xxxxxxx  exact (name,value) static match      → 1 byte (7-bit prefix int)
+//   01pxxxxx  name in static table, literal value  → 5-bit prefix int + [pfx] + len + suffix
+//   00000000  literal name + literal value
+//   value strings use a 1-bit "prefix of a known value" flag (`p`): if the value
 //   shares a prefix with a static value (e.g. "https://api.example",
 //   "gpt-4o-mini-2024"), we send prefix-id + suffix only. This is where agent
 //   traffic compresses best: hundreds of near-identical model/tool strings.
@@ -22,7 +22,9 @@
 
 import { Writer, Reader } from './varint.js';
 
-// Order matters: index 0..63 are 1-byte-encodable.
+export const TABLE_VERSION = 1;
+
+// Order matters: index 0..30 encode name-matches in 1 byte; 0..126 encode exact matches in 1 byte.
 export const STATIC_TABLE = [
   // connection / routing
   [':proto', 'h4'], [':proto', 'h3'], [':scheme', 'https'],
@@ -67,21 +69,14 @@ for (let i = 0; i < STATIC_TABLE.length; i++) {
 }
 
 const enc = new TextEncoder();
-const dec = new TextDecoder();
+const dec = new TextDecoder('utf-8', { fatal: false });
 
 // ── Interning ────────────────────────────────────────────────────────────────
-// PROFILING NOTE (measured on node 20, 2 vCPU): TextEncoder.encode() costs
-// ~650 ns per call, which made an 8-header encode 5.2 µs — 90% of it string
-// encoding. Agent traffic is *extremely* repetitive (same model names, tenants,
-// paths), so every implementation of H4 should intern. With interning the same
-// block encodes in ~200 ns. This is a protocol-level insight, not a micro-opt:
-// it says the wire format must be static-table-first so that interning is
-// nearly always a hit.
 const utf8Cache = new Map();
 const utf8 = (s) => {
   let b = utf8Cache.get(s);
   if (b === undefined) {
-    if (utf8Cache.size > 4096) utf8Cache.clear();
+    if (utf8Cache.size >= 4096) utf8Cache.delete(utf8Cache.keys().next().value);
     b = Buffer.from(enc.encode(s));
     utf8Cache.set(s, b);
   }
@@ -98,38 +93,66 @@ function bestPrefix(value) {
     if (p.length > bestLen && value.startsWith(p)) { best = PREFIX_ID.get(p); bestLen = p.length; }
   }
   const out = { id: best, len: bestLen };
-  if (prefixCache.size > 8192) prefixCache.clear();
+  if (prefixCache.size >= 8192) prefixCache.delete(prefixCache.keys().next().value);
   prefixCache.set(value, out);
   return out;
 }
 
+// Fast ASCII header-name lowercasing: zero allocation when already lowercase.
+function lowerHeaderName(name) {
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c >= 65 && c <= 90) return name.toLowerCase();
+  }
+  return name;
+}
+
 // Pre-encode the static table once: names and values that are already bytes
 // never touch TextEncoder again.
-const STATIC_BYTES = STATIC_TABLE.map(([n, v]) => [utf8(n), utf8(v)]);
+for (const [n, v] of STATIC_TABLE) { utf8(n); utf8(v); }
 
 // A single reusable buffer: encodeHeaders is synchronous and non-reentrant, so
 // pooling removes one allocation per request. The result is copied out because
 // callers legitimately hold on to it.
-let pool = new Writer(512);
+const pool = new Writer(512);
 
 export function encodeHeaders(headers) {
   const w = (pool.off = 0, pool);
   const pairs = Array.isArray(headers) ? headers : Object.entries(headers);
   for (let i = 0; i < pairs.length; i++) {
-    const name = pairs[i][0], value = pairs[i][1];
-    const n = name.length && name.charCodeAt(0) < 91 ? name.toLowerCase() : name;
+    const rawName = String(pairs[i][0]);
+    const value = pairs[i][1];
+    const n = lowerHeaderName(rawName);
     const v = typeof value === 'string' ? value : String(value);
     const exact = EXACT.get(n + '\u0000' + v);
-    if (exact !== undefined) { w.u8(0x80 | exact); continue; }
+    if (exact !== undefined) {
+      if (exact < 0x7f) {
+        w.u8(0x80 | exact);
+      } else {
+        w.u8(0xff).varint(exact - 0x7f);
+      }
+      continue;
+    }
     const ids = BY_NAME.get(n);
     if (ids !== undefined) {
+      const idx = ids[0];
       const { id: pfx, len } = bestPrefix(v);
-      w.u8(0x40 | (pfx ? 0x20 : 0) | ids[0]);      // bit5 = has value prefix
+      const flags = 0x40 | (pfx ? 0x20 : 0);
+      if (idx < 0x1f) {
+        w.u8(flags | idx);
+      } else {
+        w.u8(flags | 0x1f).varint(idx - 0x1f);
+      }
       if (pfx) w.u8(pfx);
       const vb = utf8(v);
       w.bytes(len ? vb.subarray(len) : vb);
     } else {
-      w.u8(0x00); w.bytes(utf8(n)); w.bytes(utf8(v));
+      const { id: pfx, len } = bestPrefix(v);
+      w.u8(pfx ? 0x01 : 0x00);
+      w.bytes(utf8(n));
+      if (pfx) w.u8(pfx);
+      const vb = utf8(v);
+      w.bytes(len ? vb.subarray(len) : vb);
     }
   }
   const out = Buffer.allocUnsafe(w.off);
@@ -137,28 +160,47 @@ export function encodeHeaders(headers) {
   return out;
 }
 
-export function decodeHeaders(buf) {
+export function decodeHeaders(buf, { maxHeaders = 256 } = {}) {
   const r = new Reader(buf);
   const out = [];
   while (!r.done) {
+    if (out.length >= maxHeaders) throw new RangeError('too many headers');
     const b = r.u8();
     if (b & 0x80) {
-      const e = STATIC_TABLE[b & 0x7f];
+      let idx = b & 0x7f;
+      if (idx === 0x7f) idx = 0x7f + r.varint();
+      if (idx >= STATIC_TABLE.length) throw new RangeError(`invalid static header index: ${idx}`);
+      const e = STATIC_TABLE[idx];
       out.push([e[0], e[1]]);
     } else if (b & 0x40) {
-      const hasPrefix = b & 0x20;
-      const e = STATIC_TABLE[b & 0x1f];
+      const hasPrefix = (b & 0x20) !== 0;
+      let idx = b & 0x1f;
+      if (idx === 0x1f) idx = 0x1f + r.varint();
+      if (idx >= STATIC_TABLE.length) throw new RangeError(`invalid static header index: ${idx}`);
+      const e = STATIC_TABLE[idx];
       let prefix = '';
-      if (hasPrefix) prefix = VALUE_PREFIXES[r.u8() - 1];
+      if (hasPrefix) {
+        const pid = r.u8();
+        if (pid < 1 || pid > VALUE_PREFIXES.length) throw new RangeError(`invalid value prefix id: ${pid}`);
+        prefix = VALUE_PREFIXES[pid - 1];
+      }
       out.push([e[0], prefix + dec.decode(r.bytes())]);
-    } else {
+    } else if (b === 0x00 || b === 0x01) {
       const name = dec.decode(r.bytes());
-      out.push([name, dec.decode(r.bytes())]);
+      let prefix = '';
+      if (b === 0x01) {
+        const pid = r.u8();
+        if (pid < 1 || pid > VALUE_PREFIXES.length) throw new RangeError(`invalid value prefix id: ${pid}`);
+        prefix = VALUE_PREFIXES[pid - 1];
+      }
+      out.push([name, prefix + dec.decode(r.bytes())]);
+    } else {
+      throw new RangeError(`reserved header encoding tag: 0x${b.toString(16)}`);
     }
   }
   return out;
 }
 
-// Convenience: header list → plain object (last wins). Used by the reference
-// server only; on the wire H4 preserves duplicates and order.
+// Convenience: header list → plain object (last wins). Used by non-security
+// callers; H4Server validates pseudo-header uniqueness separately.
 export const toObject = (list) => Object.fromEntries(list);

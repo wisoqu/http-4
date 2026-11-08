@@ -39,33 +39,16 @@ const fmt = (n, d = 0) => n.toLocaleString('en-US', { maximumFractionDigits: d, 
 const pct = (a, b) => `${((a / b) * 100).toFixed(1)}%`;
 
 // ── classical: one bucket per address, hard reject ───────────────────────────
-function classical() {
-  const buckets = new Map();
-  const t0 = process.hrtime.bigint();
-  let served = 0, rejected = 0;
-  for (let i = 0; i < N; i++) {
-    const honest = i % 8 !== 0 ? false : true;             // 12.5% honest traffic
-    const addr = 'ip-' + (i % ADDRESSES);
-    let b = buckets.get(addr);
-    if (!b) { b = { spent: 0, resetAt: Date.now() + WINDOW_MS }; buckets.set(addr, b); }
-    if (b.resetAt < Date.now()) { b.spent = 0; b.resetAt = Date.now() + WINDOW_MS; }
-    b.spent++;
-    if (b.spent > CLASSICAL_BUCKET) rejected++; else served++;
-  }
-  return { served, rejected, ms: Number(process.hrtime.bigint() - t0) / 1e6, honest };
-}
-
-// count honest separately
-function classicalDetailed() {
+function classicalDetailed(simNow) {
   const t0 = process.hrtime.bigint();
   const buckets = new Map();
   let honestServed = 0, honestTotal = 0, attackerServed = 0, attackerTotal = 0;
-  const now = Date.now();
   for (let i = 0; i < N; i++) {
     const honest = i % 8 === 0;
     const addr = 'ip-' + (i % ADDRESSES);
     let b = buckets.get(addr);
-    if (!b) { b = { spent: 0 }; buckets.set(addr, b); }
+    if (!b) { b = { spent: 0, resetAt: simNow + WINDOW_MS }; buckets.set(addr, b); }
+    if (b.resetAt < simNow) { b.spent = 0; b.resetAt = simNow + WINDOW_MS; }
     b.spent++;
     const ok = b.spent <= CLASSICAL_BUCKET;
     if (honest) { honestTotal++; if (ok) honestServed++; }
@@ -75,7 +58,7 @@ function classicalDetailed() {
 }
 
 // ── HTTP/4 ───────────────────────────────────────────────────────────────────
-async function h4() {
+async function h4(simNow) {
   // netMultiplier 1 ⇒ the address pool gets exactly the same allowance the
   // classical limiter gives it, so the comparison is fair.
   const limiter = new Limiter({ budget: BUDGET, windowMs: WINDOW_MS, pressure: () => 170, netMultiplier: 1 });
@@ -87,11 +70,11 @@ async function h4() {
   // (no round trip): distinct chain link ⇒ distinct quota identity, tiny cost.
   const rootGrant = mintRoot({
     keyId: 7, privateKey, caps: CAPS.READ | CAPS.DELEGATE,
-    expiresAt: Math.floor(Date.now() / 1000) + 3600, scope: '/',
+    expiresAt: Math.floor(simNow / 1000) + 3600, scope: '/',
     maxSubs: HONEST_INSTANCES, // signed ceiling on how far this grant may be fanned out
   });
   const honestTokens = Array.from({ length: HONEST_INSTANCES }, (_, i) =>
-    attenuate(rootGrant, { caps: CAPS.READ, expiresAt: Math.floor(Date.now() / 1000) + 3600, scope: '/', subs: i + 1 }));
+    attenuate(rootGrant, { caps: CAPS.READ, expiresAt: Math.floor(simNow / 1000) + 3600, scope: '/', subs: i + 1 }));
   const server = new H4Server({
     registry,
     limiter,
@@ -117,15 +100,15 @@ async function h4() {
       const c = clients[hi];
       const decision = c.shouldSend({ path: '/api', method: 'GET', cost: {} });
       if (decision && decision.send === false) { honestSelfBlocked++; continue; }
-      const r = encodeReceipt({ window: Math.floor(Date.now() / WINDOW_MS), spent: c.state.spent, blockedUntil: 0, nonce: ++c.state.nonce });
+      const { receipt: r, mac } = c._receipt(1);
       const res = await server.handle({
         headers: [[':method', 'GET'], [':path', '/api'], ['h4-agent', 'honest-' + hi], ['h4-agent-instance', 'inst-' + hi]],
         intent: { mode: 0, idem: '', deadlineMs: 30_000, costCeiling: 0, maxShape: 0, dedup: '' },
         cost: { predicted: 0, costClass: 0, effortBits: 0, budgetRemaining: 0, value: 0, tokenBudget: 0 },
-        rate: { receipt: r, mac: signReceipt(r, sessionKey) },
+        rate: { receipt: r, mac },
         cap: { token: honestTokens[hi] },
         sessionKey, peer: 'ip-' + (i % ADDRESSES),
-      });
+      }, simNow);
       if (!res.reject) honestServed++;
     } else {
       // attacker: no receipt, no identity, just volume
@@ -135,7 +118,7 @@ async function h4() {
         intent: { mode: 0, idem: '', deadlineMs: 30_000, costCeiling: 0, maxShape: 0, dedup: '' },
         cost: { predicted: 0, costClass: 0, effortBits: 0, budgetRemaining: 0, value: 0, tokenBudget: 0 },
         peer: attackerAddrs[i % ATTACK_INSTANCES],
-      });
+      }, simNow);
       if (res.reject) {
         attackerRejected++;
         if (res.reject.code === 3) attackerEffort++;
@@ -156,8 +139,9 @@ console.log(`${ADDRESSES} shared egress addresses (${fmt(N / ADDRESSES)} agents 
 console.log(`classical limiter: ${CLASSICAL_BUCKET} req/address/${WINDOW_MS / 1000}s, hard 429 (same total capacity as H4)`);
 console.log(`H4: ${BUDGET} units per identified agent per window, priced effort beyond that\n`);
 
-const cls = classicalDetailed();
-const res = await h4();
+const simNow = Math.floor(Date.now() / WINDOW_MS) * WINDOW_MS + 100;
+const cls = classicalDetailed(simNow);
+const res = await h4(simNow);
 
 console.log(`                              classical            http/4`);
 console.log(`  honest requests served   ${fmt(cls.honestServed).padStart(9)} (${pct(cls.honestServed, cls.honestTotal).padStart(6)})  ${fmt(res.honestServed).padStart(9)} (${pct(res.honestServed, res.honestTotal).padStart(6)})`);
