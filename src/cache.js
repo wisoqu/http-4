@@ -22,12 +22,22 @@ export function hashKey(...parts) {
 }
 
 function estimateSize(value) {
-  if (Buffer.isBuffer(value)) return value.length + 64;
+  if (value === null || value === undefined) return 64;
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return value.byteLength + 64;
   if (typeof value === 'string') return Buffer.byteLength(value) + 64;
+  if (typeof value === 'object') {
+    const body = value.body;
+    if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+      return body.byteLength + 192;
+    }
+    if (typeof body === 'string') {
+      return Buffer.byteLength(body) + 192;
+    }
+  }
   try {
     return Buffer.byteLength(JSON.stringify(value) ?? '') + 64;
   } catch {
-    return 256;
+    return Number.MAX_SAFE_INTEGER; // refuse caching unserializable/opaque objects safely
   }
 }
 

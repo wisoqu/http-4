@@ -1,10 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // H4 client — including an honest local accountant and online cost learner.
-//
-// The client is not a victim of rate limiting, it is a *participant*. It keeps
-// its own budget book, predicts cost before sending (learning from RESULT's
-// signed cost_asym over time), embeds signed `h4-rl` receipts on the wire, and
-// cancels requests that cannot be afforded before bytes enter the network.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import crypto from 'node:crypto';
@@ -22,6 +17,8 @@ export class H4Client {
     windowMs = 10_000,
     maxTokenBudget = 100_000,
     maxInFlight = 32,
+    maxEffortBits = 22,
+    passWallet = [],
     log = [],
     respectCeilings = true,
     key = null,
@@ -31,27 +28,33 @@ export class H4Client {
     this.budget = Math.floor(budgetPerSec * (windowMs / 1000));
     this.maxTokenBudget = maxTokenBudget;
     this.maxInFlight = maxInFlight;
+    this.maxEffortBits = maxEffortBits;
+    this.passWallet = [...passWallet];
     this.log = log;
     this.respectCeilings = respectCeilings;
     this.keyPair = key ?? crypto.generateKeyPairSync('ed25519');
-    this.learnedBias = new Map(); // `${method} ${path}` → EMA of costAsym
+    this.learnedBias = new Map();
 
     this.state = { window: 0, spent: 0, reserved: 0, blockedUntil: 0, nonce: 0 };
     this.stats = {
       sent: 0, sentVirtually: 0, selfBlocked: 0, costAvoided: 0,
       bytesIn: 0, bytesOut: 0, poeSolved: 0, poeBits: 0, poeMs: 0,
+      effortRefused: 0, passesSpent: 0,
       rateLimited: 0, deferred: 0, perRequest: [],
     };
   }
 
-  /**
-   * Adopt the server's advertised quota at/after handshake (spec §6.4).
-   */
   provision({ budget, windowMs, refillPerSec }) {
     if (windowMs) this.windowMs = windowMs;
     if (budget !== undefined) this.budget = budget;
     else if (refillPerSec !== undefined) this.budget = Math.floor(refillPerSec * (this.windowMs / 1000));
     this._roll();
+    return this;
+  }
+
+  addPasses(passes) {
+    if (Array.isArray(passes)) this.passWallet.push(...passes);
+    else if (passes) this.passWallet.push(passes);
     return this;
   }
 
@@ -66,7 +69,6 @@ export class H4Client {
     }
   }
 
-  /** Honest accounting + the receipt the server will check with one HMAC. */
   _receipt(weight) {
     this._roll();
     this.state.spent += weight;
@@ -82,7 +84,6 @@ export class H4Client {
     return { receipt, mac, spent: this.state.spent };
   }
 
-  /** Predict request cost using static model + online learned `costAsym` EMA. */
   predictCost({ path = '/', method = 'GET', intent, cost } = {}) {
     const m = method.toUpperCase();
     const base = predict(m, intent, cost);
@@ -90,10 +91,6 @@ export class H4Client {
     return Math.max(1, Math.round(base + bias));
   }
 
-  /**
-   * Decide *before* sending. Returns null if the request is affordable, or a
-   * reason object if the client should not send it at all.
-   */
   shouldSend({ path = '/', method = 'GET', intent, cost, worth = 0 }) {
     this._roll();
     const now = Date.now();
@@ -122,8 +119,10 @@ export class H4Client {
     return null;
   }
 
-  /** Build the first flight: HEADERS (incl. h4-rl / h4-effort) + INTENT + COST (+ CAP + DATA). */
-  build({ path, method = 'GET', headers = [], intent = {}, cost = {}, cap = null, body = null, effortNonce = undefined }) {
+  build({
+    path, method = 'GET', headers = [], intent = {}, cost = {},
+    cap = null, body = null, effortNonce = undefined, pass = undefined,
+  }) {
     const m = method.toUpperCase();
     const effectiveClass = classifyCost(m, intent, cost);
     const w = CLASS_WEIGHT[effectiveClass] ?? 1;
@@ -131,6 +130,7 @@ export class H4Client {
 
     const hasRl = headers.some(([k]) => k.toLowerCase() === 'h4-rl');
     const hasEffort = headers.some(([k]) => k.toLowerCase() === 'h4-effort');
+    const hasPass = headers.some(([k]) => k.toLowerCase() === 'h4-pass');
     const hdrs = [
       [':method', m],
       [':path', path],
@@ -143,10 +143,14 @@ export class H4Client {
     if (effortNonce !== undefined && !hasEffort) {
       hdrs.push(['h4-effort', String(effortNonce)]);
     }
+    if (pass && !hasPass) {
+      hdrs.push(['h4-pass', String(pass)]);
+    }
 
+    const defaultMode = m === 'SUB' ? MODE.SUBSCRIBE : MODE.QUERY;
     const parts = [
       encodeHeadersFrame(hdrs),
-      encodeIntent({ mode: MODE.QUERY, ...intent }),
+      encodeIntent({ mode: defaultMode, ...intent }),
       encodeCost({ costClass: effectiveClass, ...cost }),
     ];
     if (cap) parts.push(encodeCap(cap));
@@ -158,7 +162,6 @@ export class H4Client {
     return { frames, receipt, mac, virtualWeight: w };
   }
 
-  /** Client-side view of a response: decode frames, adopt rate policy, and learn cost_asym. */
   observe(respFrames, { path = null, method = 'GET' } = {}) {
     this.stats.bytesIn += respFrames.length;
     const out = {
@@ -216,7 +219,6 @@ export class H4Client {
         this.stats.memoReuse = (this.stats.memoReuse ?? 0) + out.result.memoReuse;
       }
       if (path && Number.isFinite(out.result.costAsym) && out.result.cache === 0) {
-        // Learn from actual execution (CACHE.MISS), not 1-unit cache hits
         const rk = `${method.toUpperCase()} ${path}`;
         const prev = this.learnedBias.get(rk) ?? 0;
         if (this.learnedBias.size >= 2048 && !this.learnedBias.has(rk)) {
@@ -227,14 +229,39 @@ export class H4Client {
     }
   }
 
-  /** Needed when the server escalates to effort: solve PoE challenge. */
+  /** Pop a single-use pass from the wallet if available (0 CPU burn). */
+  takePass() {
+    if (this.passWallet.length === 0) return null;
+    this.stats.passesSpent++;
+    return this.passWallet.shift();
+  }
+
+  /**
+   * Solve a Proof-of-Effort challenge, enforcing `maxEffortBits` so a rogue
+   * server cannot trap the client into unbounded CPU spin.
+   */
   payEffort(difficulty) {
+    const bits = difficulty.bits ?? difficulty.difficulty ?? 0;
+    if (bits > this.maxEffortBits) {
+      this.stats.effortRefused++;
+      return null;
+    }
+    let ch = difficulty.challenge;
+    let mode = difficulty.mode ?? difficulty.poeMode ?? 'sha256';
+    if (!ch && typeof difficulty.detail === 'string') {
+      if (difficulty.detail.startsWith('mh:')) {
+        mode = 'memhard';
+        ch = Buffer.from(difficulty.detail.slice(3), 'base64url');
+      } else {
+        ch = Buffer.from(difficulty.detail, 'base64url');
+      }
+    }
     const t0 = process.hrtime.bigint();
-    const sol = solvePoE(difficulty.challenge, difficulty.bits);
+    const sol = solvePoE(ch, bits, undefined, mode);
     this.stats.poeMs += Number(process.hrtime.bigint() - t0) / 1e6;
     if (!sol) return null;
     this.stats.poeSolved++;
-    this.stats.poeBits += difficulty.bits;
+    this.stats.poeBits += bits;
     return sol.nonce;
   }
 }
@@ -242,7 +269,7 @@ export class H4Client {
 function classifyCost(method, intent, cost) {
   if (cost?.costClass !== undefined && cost.costClass !== CLASS.CHEAP) return cost.costClass;
   if (cost?.costClass === CLASS.CHEAP && cost && 'costClass' in cost) return CLASS.CHEAP;
-  if (intent?.mode === MODE.MUTATE) return CLASS.EXPENSIVE;
+  if (intent?.mode === MODE.MUTATE) return cost?.costClass ?? CLASS.EXPENSIVE;
   const m = method.toUpperCase();
   if (m === 'GET' || m === 'HEAD' || m === 'SUB') return CLASS.CHEAP;
   return CLASS.NORMAL;

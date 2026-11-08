@@ -1,12 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// H4 gateway (spec §10): HTTP/1.1 + HTTP/2 ↔ HTTP/4 semantic translator.
-//
-// Why this exists:
-//   "Clean-slate protocols get applause and zero deployment." (§10)
-//   An origin running H4Server gets request coalescing, capability attenuation,
-//   dual-key rate limiting, and cost-ceiling gates *today* for legacy HTTP/1.1
-//   and HTTP/2 callers via this edge translator, while advertising `Alt-Svc`
-//   so H4-capable agents can upgrade directly.
+// H4 gateway (spec §10): HTTP/1.1 + HTTP/2 ↔ HTTP/4 semantic & SSE translator.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import http from 'node:http';
@@ -15,6 +8,7 @@ import {
   F, REJECT, CLASS, MODE, CACHE,
   iterFrames, decodeResult, decodeRate, decodeCost, decodeHeadersFrame, decodeReject,
 } from './frames.js';
+import { normalizePeerIp } from './server.js';
 
 const REJECT_TO_HTTP_STATUS = {
   [REJECT.RATE_LIMITED]: 429,
@@ -44,7 +38,13 @@ const CLASS_BY_NAME = {
   expensive: CLASS.EXPENSIVE,
 };
 
-function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
+const HTTP_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9a-zA-Z]+$/;
+
+function sanitizeHttpHeaderValue(v) {
+  return String(v).replace(/[\r\n\u0000]/g, '');
+}
+
+export function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
   const hdrs = [
     [':method', method],
     [':path', url || '/'],
@@ -62,6 +62,8 @@ function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
   let value = 0;
   let tokenBudget = 0;
   let effortNonce;
+  let pass;
+  let earlyData = false;
 
   for (const [rawK, rawV] of Object.entries(rawHeaders)) {
     if (rawV === undefined) continue;
@@ -77,6 +79,9 @@ function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
       capToken = Buffer.from(v.trim(), 'base64url');
       continue;
     }
+    if (k === 'early-data' && v.trim() === '1') {
+      earlyData = true;
+    }
     if (k === 'idempotency-key' || k === 'h4-idem') idem = v;
     else if (k === 'h4-dedup') dedup = v;
     else if (k === 'h4-deadline-ms') deadlineMs = Math.max(0, parseInt(v, 10) || 30_000);
@@ -86,6 +91,7 @@ function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
     else if (k === 'h4-cost-class') costClass = CLASS_BY_NAME[v.toLowerCase()] ?? CLASS.CHEAP;
     else if (k === 'h4-value') value = Math.max(0, parseInt(v, 10) || 0);
     else if (k === 'h4-token-budget') tokenBudget = Math.max(0, parseInt(v, 10) || 0);
+    else if (k === 'h4-pass') pass = v.trim();
     else if (k === 'h4-effort') {
       const n = Number(v);
       if (Number.isSafeInteger(n) && n >= 0) effortNonce = n;
@@ -94,9 +100,14 @@ function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
     hdrs.push([k, v]);
   }
 
-  const mode = method === 'GET' || method === 'HEAD'
-    ? MODE.QUERY
-    : (rawHeaders['h4-mode'] === 'mutate' ? MODE.MUTATE : MODE.QUERY);
+  const modeHdr = String(rawHeaders['h4-mode'] ?? '').toLowerCase();
+  const acceptHdr = String(rawHeaders['accept'] ?? '').toLowerCase();
+  let mode = MODE.QUERY;
+  if (modeHdr === 'subscribe' || acceptHdr.includes('text/event-stream') || method === 'SUB') {
+    mode = MODE.SUBSCRIBE;
+  } else if (modeHdr === 'mutate' || (method !== 'GET' && method !== 'HEAD')) {
+    mode = modeHdr === 'query' ? MODE.QUERY : (modeHdr === 'mutate' ? MODE.MUTATE : MODE.QUERY);
+  }
 
   return {
     headers: hdrs,
@@ -104,13 +115,15 @@ function extractH4Request(method, url, rawHeaders, bodyBuf, peer) {
     cost: { predicted, costClass, effortBits: 0, budgetRemaining: 0, value, tokenBudget },
     cap: capToken ? { token: capToken } : null,
     effortNonce,
+    pass,
+    earlyData,
     body: bodyBuf && bodyBuf.length ? bodyBuf : null,
-    peer,
+    peer: normalizePeerIp(peer),
     byteLength: bodyBuf ? bodyBuf.length : 0,
   };
 }
 
-function unpackH4Response(resFrames) {
+export function unpackH4Response(resFrames) {
   let result = null, rate = null, cost = null, reject = null, headers = [], body = Buffer.alloc(0);
   const chunks = [];
   for (const f of iterFrames(Buffer.concat(resFrames))) {
@@ -147,7 +160,31 @@ function readStreamBody(stream, maxBodyBytes) {
   });
 }
 
-async function handleTranslatedRequest({ handler, method, url, headers, bodyStream, peer, altSvc, maxBodyBytes, send }) {
+function mapRejectToHttp(rej, altSvc) {
+  const status = rej.code === REJECT.DEFERRED && rej.detail === '0rtt-unsafe-mutate'
+    ? 425 // RFC 8470 Too Early
+    : (REJECT_TO_HTTP_STATUS[rej.code] ?? 400);
+  const outHeaders = { 'content-type': 'application/json', 'h4-reject-code': String(rej.code) };
+  if (altSvc) outHeaders['alt-svc'] = altSvc;
+  if (rej.retryAfterMs > 0) {
+    outHeaders['retry-after'] = String(Math.max(1, Math.ceil(rej.retryAfterMs / 1000)));
+  }
+  if (rej.code === REJECT.EFFORT_REQUIRED) {
+    outHeaders['h4-poe-difficulty'] = String(rej.difficulty);
+    outHeaders['h4-poe-challenge'] = sanitizeHttpHeaderValue(rej.detail);
+  }
+  const payload = Buffer.from(JSON.stringify({
+    reject: rej.code,
+    retryAfterMs: rej.retryAfterMs,
+    difficulty: rej.difficulty,
+    detail: rej.detail,
+  }));
+  return { status, outHeaders, payload };
+}
+
+async function handleTranslatedRequest({
+  handler, method, url, headers, bodyStream, res, peer, altSvc, maxBodyBytes, send,
+}) {
   let bodyBuf;
   try {
     bodyBuf = (method === 'GET' || method === 'HEAD')
@@ -161,34 +198,74 @@ async function handleTranslatedRequest({ handler, method, url, headers, bodyStre
   }
 
   const h4Req = extractH4Request(method, url, headers, bodyBuf, peer);
+  const wantsSse = String(headers['accept'] ?? '').toLowerCase().includes('text/event-stream');
+
+  // Streaming / SSE mode over HTTP/1.1 or HTTP/2
+  if (h4Req.intent.mode === MODE.SUBSCRIBE && res) {
+    const ac = new AbortController();
+    const onClose = () => { if (!res.writableEnded) ac.abort('http-disconnect'); };
+    res.on('close', onClose);
+    let headSent = false;
+    try {
+      await handler.handleStream(h4Req, {
+        signal: ac.signal,
+        onFrame(frameBuf) {
+          if (res.writableEnded) return;
+          for (const f of iterFrames(frameBuf)) {
+            if (f.type === F.REJECT && !headSent) {
+              headSent = true;
+              const { status, outHeaders, payload } = mapRejectToHttp(decodeReject(f.payload), altSvc);
+              res.writeHead(status, outHeaders);
+              res.end(payload);
+            } else if (f.type === F.HEADERS && !headSent) {
+              headSent = true;
+              const outHeaders = {
+                'content-type': wantsSse ? 'text/event-stream' : 'application/x-ndjson',
+                'cache-control': 'no-cache',
+              };
+              if (altSvc) outHeaders['alt-svc'] = altSvc;
+              for (const [k, v] of decodeHeadersFrame(f.payload)) {
+                if (!k.startsWith(':') && k !== 'content-type' && HTTP_TOKEN_RE.test(k)) {
+                  outHeaders[k] = sanitizeHttpHeaderValue(v);
+                }
+              }
+              res.writeHead(200, outHeaders);
+            } else if (f.type === F.DATA && headSent) {
+              if (wantsSse) {
+                const lines = Buffer.from(f.payload).toString('utf8').replace(/\r?\n$/, '').split(/\r?\n/);
+                res.write(lines.map((l) => `data: ${l}\n`).join('') + '\n');
+              } else {
+                res.write(f.payload);
+              }
+            } else if (f.type === F.RESULT && headSent && wantsSse) {
+              const r = decodeResult(f.payload);
+              res.write(`event: h4-result\ndata: ${JSON.stringify(r)}\n\n`);
+            }
+          }
+        },
+      });
+      if (!res.writableEnded) res.end();
+    } finally {
+      res.removeListener('close', onClose);
+    }
+    return;
+  }
+
   const h4Res = await handler.handle(h4Req);
   const decoded = unpackH4Response(h4Res.frames);
   const outHeaders = {};
   if (altSvc) outHeaders['alt-svc'] = altSvc;
 
   if (decoded.reject) {
-    const status = REJECT_TO_HTTP_STATUS[decoded.reject.code] ?? 400;
-    outHeaders['content-type'] = 'application/json';
-    outHeaders['h4-reject-code'] = String(decoded.reject.code);
-    if (decoded.reject.retryAfterMs > 0) {
-      outHeaders['retry-after'] = String(Math.max(1, Math.ceil(decoded.reject.retryAfterMs / 1000)));
-    }
-    if (decoded.reject.code === REJECT.EFFORT_REQUIRED) {
-      outHeaders['h4-poe-difficulty'] = String(decoded.reject.difficulty);
-      outHeaders['h4-poe-challenge'] = decoded.reject.detail;
-    }
-    const payload = Buffer.from(JSON.stringify({
-      reject: decoded.reject.code,
-      retryAfterMs: decoded.reject.retryAfterMs,
-      difficulty: decoded.reject.difficulty,
-      detail: decoded.reject.detail,
-    }));
-    send(status, outHeaders, method === 'HEAD' ? Buffer.alloc(0) : payload);
+    const { status, outHeaders: rHdrs, payload } = mapRejectToHttp(decoded.reject, altSvc);
+    send(status, rHdrs, method === 'HEAD' ? Buffer.alloc(0) : payload);
     return;
   }
 
   for (const [k, v] of decoded.headers) {
-    if (!k.startsWith(':')) outHeaders[k] = v;
+    if (!k.startsWith(':') && HTTP_TOKEN_RE.test(k)) {
+      outHeaders[k] = sanitizeHttpHeaderValue(v);
+    }
   }
   if (decoded.result) {
     outHeaders['h4-cost-actual'] = String(decoded.result.costActual);
@@ -209,17 +286,24 @@ async function handleTranslatedRequest({ handler, method, url, headers, bodyStre
 }
 
 /**
- * HTTP/1.1 ↔ HTTP/4 edge gateway.
+ * HTTP/1.1 ↔ HTTP/4 edge gateway with anti-Slowloris timeouts.
  */
-export function createGateway({ handler, altSvcPort = null, maxBodyBytes = 4 * 1024 * 1024 } = {}) {
+export function createGateway({
+  handler,
+  altSvcPort = null,
+  maxBodyBytes = 4 * 1024 * 1024,
+  headersTimeoutMs = 10_000,
+  requestTimeoutMs = 30_000,
+} = {}) {
   const altSvc = altSvcPort ? `h4=":${altSvcPort}"; ma=86400` : null;
-  return http.createServer((req, res) => {
+  const srv = http.createServer((req, res) => {
     handleTranslatedRequest({
       handler,
       method: (req.method ?? 'GET').toUpperCase(),
       url: req.url ?? '/',
       headers: req.headers,
       bodyStream: req,
+      res,
       peer: req.socket?.remoteAddress ?? 'anon',
       altSvc,
       maxBodyBytes,
@@ -235,12 +319,21 @@ export function createGateway({ handler, altSvcPort = null, maxBodyBytes = 4 * 1
       }
     });
   });
+  srv.headersTimeout = headersTimeoutMs;
+  srv.requestTimeout = requestTimeoutMs;
+  srv.keepAliveTimeout = 5_000;
+  return srv;
 }
 
 /**
  * HTTP/2 (+ optional HTTP/1.1 ALPN fallback) ↔ HTTP/4 edge gateway.
  */
-export function createH2Gateway({ handler, tlsOptions = null, altSvcPort = null, maxBodyBytes = 4 * 1024 * 1024 } = {}) {
+export function createH2Gateway({
+  handler,
+  tlsOptions = null,
+  altSvcPort = null,
+  maxBodyBytes = 4 * 1024 * 1024,
+} = {}) {
   const altSvc = altSvcPort ? `h4=":${altSvcPort}"; ma=86400` : null;
   const onRequest = (req, res) => {
     const method = (req.headers[':method'] ?? req.method ?? 'GET').toUpperCase();
@@ -252,6 +345,7 @@ export function createH2Gateway({ handler, tlsOptions = null, altSvcPort = null,
       url,
       headers: req.headers,
       bodyStream: req,
+      res,
       peer,
       altSvc,
       maxBodyBytes,

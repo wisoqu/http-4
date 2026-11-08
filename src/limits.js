@@ -1,16 +1,23 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// H4-LIMIT: rate limiting that the *client* helps enforce.
+// H4-LIMIT: rate limiting that the *client* helps enforce, accelerated by C11.
 //
-// Three tiers, each cheaper than the last:
-//   1. COOPERATIVE (default, costs the server ~1 HMAC)
+// Four tiers, each cheaper than the origin:
+//   1. COOPERATIVE (default, costs the server ~1 HMAC via C11 fast-path)
 //   2. ENFORCED    (costs the server ~2 integer lookups: instance + aggregate)
-//   3. EFFORT      (costs the server 1 SHA-256 + single-use nonce check)
+//   3. PASS        (single-use `h4-pass` cryptographic token: 0 client CPU burn)
+//   4. EFFORT      (SHA-256 or 4 KB cache-hard `memhard` puzzle + anti-replay)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import crypto from 'node:crypto';
 import { CLASS } from './frames.js';
+import { nativeBinding } from './native.js';
 
 export const CLASS_WEIGHT = { [CLASS.CHEAP]: 1, [CLASS.NORMAL]: 5, [CLASS.EXPENSIVE]: 60 };
+
+const RECEIPT_DOMAIN = Buffer.from('H4-RL-RECEIPT-v1|');
+const CHAL_DOMAIN = Buffer.from('H4-POE-CHAL-v1|');
+const MH1_DOMAIN = Buffer.from('H4-MH1|');
+const MH2_DOMAIN = Buffer.from('H4-MH2|');
 
 const b64u = (b) => b.toString('base64url');
 const RECEIPT_RE = /^[0-9]+(\.[0-9a-z]+){4}$/;
@@ -19,6 +26,11 @@ function toUInt53(v) {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n));
+}
+
+function writeNoncePair(buf, nonce) {
+  buf.writeUInt32BE(nonce >>> 0, 0);
+  buf.writeUInt32BE(Math.floor(nonce / 0x100000000) >>> 0, 4);
 }
 
 // ── Receipt encoding: ver.window.spent.blockedUntilMs.nonce (base36, 53-bit safe)
@@ -53,7 +65,11 @@ export function decodeReceipt(s) {
 }
 
 export function signReceipt(receipt, key) {
-  return b64u(crypto.createHmac('sha256', key).update(receipt).digest().subarray(0, 12));
+  if (nativeBinding) {
+    const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
+    return b64u(nativeBinding.hmacSha256(keyBuf, RECEIPT_DOMAIN, Buffer.from(receipt), 12));
+  }
+  return b64u(crypto.createHmac('sha256', key).update(RECEIPT_DOMAIN).update(receipt).digest().subarray(0, 12));
 }
 
 export function verifyReceipt(receiptStr, macStr, key) {
@@ -64,46 +80,136 @@ export function verifyReceipt(receiptStr, macStr, key) {
   return decodeReceipt(receiptStr);
 }
 
-// ── Proof-of-effort ─────────────────────────────────────────────────────────
-// Challenge is derived, not stored: server recomputes it from (subject, window)
-// so a fleet of edges shares challenges with zero state.
+// ── Proof-of-effort (SHA-256 + 4 KB cache-hard `memhard`) ───────────────────
 
-export function poeChallenge(subject, window) {
-  return crypto.createHash('sha256').update(subject).update('|').update(String(window)).digest();
+export function poeChallenge(subject, window, mode = 'sha256') {
+  return crypto.createHash('sha256')
+    .update(CHAL_DOMAIN)
+    .update(String(subject))
+    .update('|')
+    .update(String(window))
+    .update('|')
+    .update(mode)
+    .digest();
 }
 
 export function hasLeadingZeroBits(buf, bits) {
   if (bits <= 0) return true;
   if (bits > buf.length * 8) return false;
   let have = 0;
-  for (const byte of buf) {
-    if (byte === 0) { have += 8; if (have >= bits) return true; continue; }
-    let b = byte, z = 0;
-    while ((b & 0x80) === 0) { z++; b = (b << 1) & 0xff; }
-    have += z;
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if (byte === 0) {
+      have += 8;
+      if (have >= bits) return true;
+      continue;
+    }
+    have += Math.clz32(byte) - 24;
     return have >= bits;
   }
   return have >= bits;
 }
 
-export function solvePoE(challenge, bits, maxIter = 1 << 26) {
-  const buf = Buffer.alloc(8 + challenge.length);
-  challenge.copy(buf, 8);
+/** Pure-JS reference implementation of the 4 KB cache-hard puzzle (bit-exact with C11). */
+export function memHardHashJs(challenge, nonce) {
+  const nbuf = Buffer.allocUnsafe(8);
+  writeNoncePair(nbuf, nonce);
+  const seed0 = crypto.createHash('sha256')
+    .update(MH1_DOMAIN)
+    .update(nbuf)
+    .update(challenge)
+    .digest();
+
+  const s = new Uint32Array(8);
+  for (let i = 0; i < 8; i++) s[i] = seed0.readUInt32BE(i * 4);
+
+  const pad = new Uint32Array(1024);
+  let acc = (s[0] ^ 0x9e3779b9) >>> 0;
+  for (let i = 0; i < 1024; i++) {
+    const w = (s[i & 7] + i) >>> 0;
+    const rot = ((w << 13) | (w >>> 19)) >>> 0;
+    acc = (acc ^ rot) >>> 0;
+    acc = (Math.imul(acc, 0x85ebca6b) + 0xc2b2ae35) >>> 0;
+    pad[i] = (acc ^ (acc >>> 16)) >>> 0;
+  }
+
+  let st = (s[1] ^ pad[s[2] & 1023]) >>> 0;
+  for (let r = 0; r < 64; r++) {
+    const idx = st & 1023;
+    const v = pad[idx];
+    st = Math.imul((st ^ v ^ r) >>> 0, 0xcc9e2d51) >>> 0;
+    st = Math.imul(((st << 15) | (st >>> 17)) >>> 0, 0x1b873593) >>> 0;
+    const dst = (idx + (st >>> 22) + 1) & 1023;
+    pad[dst] = (pad[dst] ^ st) >>> 0;
+  }
+
+  const mix = Buffer.allocUnsafe(32);
+  for (let k = 0; k < 8; k++) {
+    const f = (pad[((st + k * 127) >>> 0) & 1023] ^ st) >>> 0;
+    mix.writeUInt32BE(f, k * 4);
+  }
+
+  return crypto.createHash('sha256')
+    .update(MH2_DOMAIN)
+    .update(nbuf)
+    .update(challenge)
+    .update(mix)
+    .digest();
+}
+
+export function memHardHash(challenge, nonce) {
+  const ch = Buffer.isBuffer(challenge) ? challenge : Buffer.from(challenge);
+  if (nativeBinding) return nativeBinding.memHardHash(ch, nonce);
+  return memHardHashJs(ch, nonce);
+}
+
+export function solveMemHard(challenge, bits, maxIter = 1 << 22) {
+  const ch = Buffer.isBuffer(challenge) ? challenge : Buffer.from(challenge);
+  if (bits <= 0) return { nonce: 0, hash: Buffer.alloc(32) };
+  if (bits > 28 || maxIter <= 0) return null;
+  if (nativeBinding) return nativeBinding.solveMemHard(ch, bits, maxIter);
   for (let i = 0; i < maxIter; i++) {
-    buf.writeUInt32BE(i >>> 0, 0);
-    buf.writeUInt32BE(Math.floor(i / 0x100000000) >>> 0, 4);
+    const h = memHardHashJs(ch, i);
+    if (hasLeadingZeroBits(h, bits)) return { nonce: i, hash: h };
+  }
+  return null;
+}
+
+export function checkMemHard(challenge, nonce, bits) {
+  if (!Number.isSafeInteger(nonce) || nonce < 0) return false;
+  if (bits <= 0) return true;
+  if (bits > 64) return false;
+  const ch = Buffer.isBuffer(challenge) ? challenge : Buffer.from(challenge);
+  if (nativeBinding) return nativeBinding.checkMemHard(ch, nonce, bits);
+  return hasLeadingZeroBits(memHardHashJs(ch, nonce), bits);
+}
+
+export function solvePoE(challenge, bits, maxIter = 1 << 26, mode = 'sha256') {
+  if (mode === 'memhard') return solveMemHard(challenge, bits, maxIter);
+  const ch = Buffer.isBuffer(challenge) ? challenge : Buffer.from(challenge);
+  if (bits <= 0) return { nonce: 0, hash: Buffer.alloc(32) };
+  if (bits > 30 || maxIter <= 0) return null;
+  if (nativeBinding) return nativeBinding.solvePoE(ch, bits, maxIter);
+  const buf = Buffer.alloc(8 + ch.length);
+  ch.copy(buf, 8);
+  for (let i = 0; i < maxIter; i++) {
+    writeNoncePair(buf, i);
     const h = crypto.createHash('sha256').update(buf).digest();
     if (hasLeadingZeroBits(h, bits)) return { nonce: i, hash: h };
   }
   return null;
 }
 
-export function checkPoE(challenge, nonce, bits) {
+export function checkPoE(challenge, nonce, bits, mode = 'sha256') {
+  if (mode === 'memhard') return checkMemHard(challenge, nonce, bits);
   if (!Number.isSafeInteger(nonce) || nonce < 0) return false;
-  const buf = Buffer.alloc(8 + challenge.length);
-  buf.writeUInt32BE(nonce >>> 0, 0);
-  buf.writeUInt32BE(Math.floor(nonce / 0x100000000) >>> 0, 4);
-  challenge.copy(buf, 8);
+  if (bits <= 0) return true;
+  if (bits > 64) return false;
+  const ch = Buffer.isBuffer(challenge) ? challenge : Buffer.from(challenge);
+  if (nativeBinding) return nativeBinding.checkPoE(ch, nonce, bits);
+  const buf = Buffer.alloc(8 + ch.length);
+  writeNoncePair(buf, nonce);
+  ch.copy(buf, 8);
   return hasLeadingZeroBits(crypto.createHash('sha256').update(buf).digest(), bits);
 }
 
@@ -115,19 +221,30 @@ export class Limiter {
    *  budget      units available at window start
    *  windowMs    refill period
    *  pressure    fn() → 0..255 current system pressure (queue depth, CPU, …)
+   *  poeMode     'sha256' | 'memhard'
+   *  passIssuer  optional PassIssuer instance for `h4-pass` zero-CPU bypass
    */
-  constructor({ budget = 200, windowMs = 10_000, pressure = () => 0, netMultiplier = 4 } = {}) {
+  constructor({
+    budget = 200,
+    windowMs = 10_000,
+    pressure = () => 0,
+    netMultiplier = 4,
+    poeMode = 'sha256',
+    passIssuer = null,
+  } = {}) {
     this.budget = budget;
     this.windowMs = windowMs;
     this.pressure = pressure;
     this.netMultiplier = netMultiplier;
+    this.poeMode = poeMode;
+    this.passIssuer = passIssuer;
     this.identityBonus = 2; // verified callers get 3× the anonymous allowance
     this.netEntries = new Map(); // address/grant → { window, spent }
     this.entries = new Map();    // subject → { window, spent, blockedUntil, lastNonce, punish }
     this.usedPoe = new Map();    // `${subject}:${poeWin}:${nonce}` → poeWin (anti-replay)
     this.stats = {
       receiptsOk: 0, receiptsMissing: 0, receiptsForged: 0,
-      rejected: 0, poeServed: 0, poeRedeemed: 0, hmacOps: 0,
+      rejected: 0, poeServed: 0, poeRedeemed: 0, passRedeemed: 0, hmacOps: 0,
     };
   }
 
@@ -139,8 +256,6 @@ export class Limiter {
       if (this.entries.size >= 200000) this._gc(now);
       this.entries.set(subject, e);
     } else if (e.window !== window) {
-      // Preserve lastNonce & punish across window rollovers so receipts from
-      // older windows cannot be replayed in newer windows.
       e.window = window;
       e.spent = 0;
     }
@@ -166,13 +281,20 @@ export class Limiter {
     }
   }
 
+  _scaleDifficulty(rawBits) {
+    if (this.poeMode === 'memhard') {
+      return Math.max(4, Math.min(20, rawBits - 4));
+    }
+    return Math.min(rawBits, 28);
+  }
+
   /**
    * Single entry point, four cheap steps, no allocations on the hot path.
-   * Returns {allow, code, retryAfterMs, difficulty, pressure, budgetRemaining, tier}.
    */
   check({
     subject, net = null, netAllowance = 0, costClass = CLASS.CHEAP,
     receipt = null, mac = null, sessionKey = null, identityTrusted = false,
+    earlyData = false,
   }, now = Date.now()) {
     const pressure = this.pressure();
     const weight = CLASS_WEIGHT[costClass] ?? 1;
@@ -180,8 +302,6 @@ export class Limiter {
     const tier = [];
     const window = e.window;
 
-    // Aggregate key: bounds instance churn for anonymous callers and token
-    // fan-out for identified ones.
     if (net) {
       let n = this.netEntries.get(net);
       if (!n || n.window !== window) {
@@ -195,22 +315,25 @@ export class Limiter {
         tier.push('net');
         if (pressure >= 96) {
           this.stats.poeServed++;
-          return { allow: false, code: 'EFFORT_REQUIRED', difficulty: Math.min(8 + (pressure >> 5), 28), retryAfterMs: 0, pressure, tier };
+          return {
+            allow: false, code: 'EFFORT_REQUIRED',
+            difficulty: this._scaleDifficulty(8 + (pressure >> 5)),
+            poeMode: this.poeMode, retryAfterMs: 0, pressure, tier,
+          };
         }
         this.stats.rejected++;
         return { allow: false, code: 'RATE_LIMITED', retryAfterMs: this.windowMs - (now % this.windowMs), pressure, tier };
       }
     }
 
-    // A blocked subject is rejected for free.
     if (e.blockedUntil > now) {
       this.stats.rejected++;
       return { allow: false, code: 'RATE_LIMITED', retryAfterMs: e.blockedUntil - now, pressure, tier: ['blocked'] };
     }
 
-    // Tier 1 — cooperative receipt.
+    // Tier 1 — cooperative receipt (skip replay punishment on 0-RTT earlyData).
     let cooperative = false;
-    if (receipt && mac && sessionKey) {
+    if (receipt && mac && sessionKey && !earlyData) {
       const r = verifyReceipt(receipt, mac, sessionKey);
       this.stats.hmacOps++;
       if (!r) {
@@ -218,24 +341,21 @@ export class Limiter {
         e.punish = Math.min(e.punish + 1, 6);
       } else if (r.nonce <= e.lastNonce) {
         this.stats.receiptsForged++;
-        e.punish = Math.min(e.punish + 1, 6); // replay / rollback
+        e.punish = Math.min(e.punish + 1, 6);
       } else {
         e.lastNonce = r.nonce;
-        // Only merge reported spend when the receipt belongs to the current window
-        // so boundary-straddling in-flight requests don't pollute the fresh window.
         if (r.window === window && r.spent > e.spent) e.spent = r.spent;
         if (r.blockedUntil > e.blockedUntil) e.blockedUntil = r.blockedUntil;
         cooperative = true;
         this.stats.receiptsOk++;
         tier.push('cooperative');
-        // Honest client that blocked itself: honour it under load, relax when calm.
         if (r.blockedUntil > now) {
           if (pressure < 64) {
             e.blockedUntil = 0;
             tier.push('relaxed');
           } else {
             this.stats.rejected++;
-            return { allow: false, code: 'RATE_LIMITED', retryAfterMs: e.blockedUntil - now, pressure, tier };
+            return { allow: false, code: 'RATE_LIMITED', retryAfterMs: r.blockedUntil - now, pressure, tier };
           }
         }
       }
@@ -250,13 +370,12 @@ export class Limiter {
     const effective = this.budget + trustedBonus;
 
     if (e.spent > effective) {
-      // Tier 3 — price the request instead of banning the caller.
       const punishScale = 1 + e.punish;
-      const difficulty = Math.min(6 + 4 * punishScale + (pressure >> 5), 28);
+      const difficulty = this._scaleDifficulty(6 + 4 * punishScale + (pressure >> 5));
       if (pressure >= 128 || e.punish > 0) {
         this.stats.poeServed++;
         tier.push('effort');
-        return { allow: false, code: 'EFFORT_REQUIRED', difficulty, retryAfterMs: 0, pressure, tier };
+        return { allow: false, code: 'EFFORT_REQUIRED', difficulty, poeMode: this.poeMode, retryAfterMs: 0, pressure, tier };
       }
       e.blockedUntil = now + Math.min(this.windowMs * punishScale, 60_000);
       this.stats.rejected++;
@@ -270,21 +389,48 @@ export class Limiter {
       allow: true, code: 'OK', pressure,
       budgetRemaining: effective - e.spent,
       effectiveBudget: effective,
-      blockUntilMs: pressure >= 128 ? now + 250 : 0, // tell the client to slow down early
+      blockUntilMs: pressure >= 128 ? now + 250 : 0,
       tier,
     };
   }
 
   /**
-   * Verify and redeem a single-use Proof-of-Effort solution inline (no recursion).
-   * Credits both the subject bucket and the aggregate net bucket, and prevents
-   * nonce replay within the PoE challenge window.
+   * Redeem a single-use cryptographic `h4-pass` token in ~2 µs (0 client CPU burn).
    */
-  redeemPoE({ subject, net = null, poeWindow, challenge, nonce, difficulty, costClass = CLASS.CHEAP }, now = Date.now()) {
+  redeemPass({ subject, net = null, passToken, costClass = CLASS.CHEAP }, now = Date.now()) {
+    if (!this.passIssuer || !passToken) return null;
+    const res = this.passIssuer.redeem(passToken, { now });
+    if (!res.ok) return null;
+
+    const weight = CLASS_WEIGHT[costClass] ?? 1;
+    const credit = weight * 4;
+    const e = this._entry(subject, now);
+    const effective = this.budget * (1 + (this.identityBonus ?? 2));
+    e.spent = Math.max(0, Math.min(e.spent, this.budget) - credit);
+    e.blockedUntil = 0;
+
+    if (net) {
+      const n = this.netEntries.get(net);
+      if (n) n.spent = Math.max(0, n.spent - credit);
+    }
+    this.stats.passRedeemed++;
+    return {
+      allow: true, code: 'OK', pressure: this.pressure(),
+      budgetRemaining: Math.max(0, this.budget - e.spent),
+      effectiveBudget: effective,
+      blockUntilMs: 0,
+      tier: ['pass'],
+    };
+  }
+
+  /**
+   * Verify and redeem a single-use Proof-of-Effort solution inline (no recursion).
+   */
+  redeemPoE({ subject, net = null, poeWindow, challenge, nonce, difficulty, costClass = CLASS.CHEAP, mode = this.poeMode }, now = Date.now()) {
     if (!Number.isSafeInteger(nonce) || nonce < 0) return null;
     const replayKey = `${subject}:${poeWindow}:${nonce}`;
     if (this.usedPoe.has(replayKey)) return null;
-    if (!checkPoE(challenge, nonce, difficulty)) return null;
+    if (!checkPoE(challenge, nonce, difficulty, mode)) return null;
 
     if (this.usedPoe.size >= 50000) {
       for (const [k, w] of this.usedPoe) {
@@ -297,7 +443,6 @@ export class Limiter {
     const weight = CLASS_WEIGHT[costClass] ?? 1;
     const credit = weight * 4;
     const e = this._entry(subject, now);
-    // Bring subject back within effective budget and grant headroom for this + 3 more requests
     const effective = this.budget * (1 + (this.identityBonus ?? 2));
     e.spent = Math.max(0, Math.min(e.spent, this.budget) - credit);
     e.blockedUntil = 0;
@@ -316,11 +461,19 @@ export class Limiter {
     };
   }
 
-  // Per-connection random session key.
+  /** Refund unused reserved budget (e.g. when an agent cancels a stream early via F.CANCEL). */
+  refund({ subject, net = null, units = 0 }, now = Date.now()) {
+    if (!Number.isFinite(units) || units <= 0) return;
+    const e = this._entry(subject, now);
+    e.spent = Math.max(0, e.spent - units);
+    if (net) {
+      const n = this.netEntries.get(net);
+      if (n) n.spent = Math.max(0, n.spent - units);
+    }
+  }
+
   static sessionKey() { return crypto.randomBytes(32); }
 
-  // Stateless cluster session key (spec §12.1): any edge node sharing `clusterSecret`
-  // can issue and verify receipt MACs for `peerId` without sticky sessions.
   static deriveSessionKey(clusterSecret, peerId) {
     return crypto.createHmac('sha256', clusterSecret).update('h4-rl-v1|').update(String(peerId)).digest();
   }

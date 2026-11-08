@@ -1,0 +1,8 @@
+node_modules/
+native/bin/
+*.node
+*.o
+*.so
+*.dylib
+.DS_Store
+coverage/
