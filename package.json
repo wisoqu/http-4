@@ -5,6 +5,9 @@
   "type": "module",
   "main": "./src/index.js",
   "types": "./types/index.d.ts",
+  "bin": {
+    "http4": "./bin/http4.js"
+  },
   "exports": {
     ".": {
       "types": "./types/index.d.ts",
@@ -19,7 +22,9 @@
     "./native": "./src/native.js"
   },
   "scripts": {
+    "postinstall": "node scripts/build-native.js || true",
     "build:native": "node scripts/build-native.js",
+    "doctor": "node bin/http4.js doctor",
     "test": "node test/run.js && node test/security-audit.js",
     "test:unit": "node test/run.js",
     "test:san": "node scripts/build-native.js --san",
