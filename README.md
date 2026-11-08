@@ -10,7 +10,7 @@
 
 ```
 $ node test/run.js
-41 passed, 0 failed
+62 passed, 0 failed
 
 $ node demo.js
 …
@@ -24,8 +24,8 @@ $ node demo.js
 Нужен только Node.js ≥ 20. Зависимостей нет.
 
 ```bash
-node test/run.js            # 41 инвариант; каждый соответствует разделу спеки
-node demo.js                # end-to-end по реальному TLS-сокету, 7 сценариев
+node test/run.js            # 62 инварианта; каждый соответствует разделу спеки
+node demo.js                # end-to-end по реальному TLS 1.3 (ALPN h4), 7 сценариев
 node bench/bench.js         # размеры на проводе, кодек, примитивы, экономика PoE
 node bench/attack-sim.js    # сравнение collateral damage по-честному
 ```
@@ -34,24 +34,25 @@ node bench/attack-sim.js    # сравнение collateral damage по-чест
 
 | Файл | О чём |
 |---|---|
-| `src/varint.js` | кодирование целых, QUIC-совместимое (бесплатный путь в QUIC-поток) |
+| `src/varint.js` | кодирование целых, QUIC-совместимое (RFC 9000 §16, до 62 бит + безопасный zigzag) |
 | `src/headers.js` | статическая таблица под агентов, префиксный словарь значений, интернирование |
-| `src/frames.js` | 16 типов кадров: `INTENT`, `COST`, `CAP`, `RESULT`, `RATE`, `REJECT` |
-| `src/identity.js` | capability-токены (macaroon-стиль), офлайн-сужение прав, кэш проверки |
-| `src/limits.js` | три ступени: кооперативная квитанция → per-identity bucket → proof-of-effort |
-| `src/cache.js` | LRU + coalescing (100 одинаковых запросов = 1 вычисление) + stale-while-revalidate |
-| `src/server.js` | порядок проверок от дешёвых к дорогим; экономика в каждом ответе |
-| `src/client.js` | честный учёт бюджета, самоблокировка, оценка «а стоит ли отправлять» |
-| `src/wire.js` | конверт stream-id поверх TLS 1.3 (в продакшене — QUIC) |
+| `src/frames.js` | 14 типов кадров: `HELLO`, `INTENT`, `COST`, `CAP`, `RESULT`, `RATE`, `REJECT`, `ACCESS` |
+| `src/identity.js` | capability-токены (macaroon-стиль), подписанный `maxSubs`, офлайн-сужение прав, кэш проверки |
+| `src/limits.js` | три ступени: кооперативная квитанция → per-identity bucket → одноразовый proof-of-effort |
+| `src/cache.js` | tenant-изолированный LRU + coalescing (100 одинаковых запросов = 1 вычисление) + SWR |
+| `src/server.js` | порядок проверок от дешёвых к дорогим, `deadline_ms`, `idem`, обучение оценке стоимости |
+| `src/client.js` | честный учёт бюджета, онлайн-обучение по `cost_asym`, самоблокировка |
+| `src/wire.js` | QUIC-нумерованные потоки + `F.HELLO` поверх TLS 1.3 с `ALPN h4` |
+| `src/gateway.js` | edge-гейтвей HTTP/1.1 и HTTP/2 ↔ HTTP/4 (`Alt-Svc`, `Bearer` capability, `RateLimit-*`) |
 | `spec/http4.md` | **главный документ**: дизайн, обоснования, измерения, журнал ошибок |
 
 ## Ключевые измеренные числа
 
-Всё на 2 vCPU / Node 20, воспроизводимо через `bench/`.
+Всё на 2 vCPU / Node 22, воспроизводимо через `bench/`.
 
 | | |
 |---|---|
-| простой GET на проводе | **11 байт** (HTTP/1.1: 72) |
+| простой GET на проводе | **12 байт** (HTTP/1.1: 72) |
 | агентский запрос, 8 заголовков | **48 байт** (HTTP/1.1: 200) |
 | кодирование 8 заголовков | 1.7 µs |
 | проверка capability (кэш корня, 2 хопа) | 15 µs |

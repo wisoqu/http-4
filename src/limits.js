@@ -1,71 +1,55 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // H4-LIMIT: rate limiting that the *client* helps enforce.
 //
-// The problem with every classical limiter: the server pays first. To reject a
-// bot it must accept a connection, parse a request, hit a counter, build a
-// response. That is the entire volume of a volumetric L7 attack.
-//
-// H4 flips it — three tiers, each cheaper than the last:
-//
+// Three tiers, each cheaper than the last:
 //   1. COOPERATIVE (default, costs the server ~1 HMAC)
-//      After the handshake the server hands the client a per-session key. The
-//      client sends `h4-rl: <receipt>,<mac>` on every request, where the receipt
-//      is its own honest accounting: how many cost-units it has spent in this
-//      window and until when it has blocked *itself*. The client does the
-//      bookkeeping, the server does one HMAC (274k ops/s → ~3.6 µs) and a
-//      monotonic-counter replay check.
-//      A well-behaved client that hits its budget stops sending. The attack
-//      never reaches the CPU: it is cancelled client-side, by the client's own
-//      limiter, before the bytes exist.
-//
-//   2. ENFORCED (costs the server one integer)
-//      Two keys, not one. A per-instance bucket alone is worthless because a
-//      client can mint instance IDs for free; a per-address bucket alone is
-//      unfair because it punishes everyone behind a CGNAT. So H4 enforces BOTH:
-//      the instance bucket bounds a single agent, and a deliberately generous
-//      aggregate bucket per network address bounds *instance churn*. A caller
-//      with a verified capability token escapes the shared pool entirely — that
-//      is the incentive to have an identity, and the reason honest clients do
-//      not suffer when their neighbours misbehave.
-//      Missing/stale/forged receipt → server falls back to a per-subject token
-//      bucket. No HMAC, no allocation: ~1 dict lookup and an integer.
-//
-//   3. EFFORT (costs the server one SHA-256)
-//      Under pressure, the server does not ban — it prices. A client that
-//      cannot earn budget with identity can earn it with proof-of-effort.
-//      Server cost stays constant while attacker cost grows as 2^difficulty.
-//
-// The point of tier 1 is not trust: it is that *honest clients see the ceiling
-// earlier than the server does*. Collateral damage drops because the network
-// degrades in proportion to a client's own reported spend rather than by
-// hard-cutting everyone in a shared IP/CIDR bucket.
+//   2. ENFORCED    (costs the server ~2 integer lookups: instance + aggregate)
+//   3. EFFORT      (costs the server 1 SHA-256 + single-use nonce check)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import crypto from 'node:crypto';
 import { CLASS } from './frames.js';
 
-// What each request class costs, in budget units. Operators tune these; the
-// defaults encode "a cache hit is basically free, an LLM call is not".
 export const CLASS_WEIGHT = { [CLASS.CHEAP]: 1, [CLASS.NORMAL]: 5, [CLASS.EXPENSIVE]: 60 };
 
 const b64u = (b) => b.toString('base64url');
-const fromB64u = (s) => Buffer.from(s, 'base64url');
+const RECEIPT_RE = /^[0-9]+(\.[0-9a-z]+){4}$/;
 
-// ── Receipt encoding: fixed layout, ~46 bytes on the wire ───────────────────
-//  ver.window.spent.blockedUntil.nonce
+function toUInt53(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n));
+}
+
+// ── Receipt encoding: ver.window.spent.blockedUntilMs.nonce (base36, 53-bit safe)
 export function encodeReceipt(r) {
-  // base36 keeps it short and parseable by eye in logs
-  return `${r.ver ?? 1}.${(r.window | 0).toString(36)}.${(r.spent | 0).toString(36)}.${(r.blockedUntil | 0).toString(36)}.${(r.nonce | 0).toString(36)}`;
+  const ver = toUInt53(r.ver ?? 1);
+  const window = toUInt53(r.window);
+  const spent = toUInt53(r.spent);
+  const blockedUntil = toUInt53(r.blockedUntil);
+  const nonce = toUInt53(r.nonce);
+  return `${ver}.${window.toString(36)}.${spent.toString(36)}.${blockedUntil.toString(36)}.${nonce.toString(36)}`;
 }
 
 export function decodeReceipt(s) {
+  if (typeof s !== 'string' || s.length > 128 || !RECEIPT_RE.test(s)) return null;
   const p = s.split('.');
   if (p.length !== 5) return null;
-  return {
-    ver: parseInt(p[0], 10),
-    window: parseInt(p[1], 36), spent: parseInt(p[2], 36),
-    blockedUntil: parseInt(p[3], 36), nonce: parseInt(p[4], 36),
-  };
+  const ver = parseInt(p[0], 10);
+  const window = parseInt(p[1], 36);
+  const spent = parseInt(p[2], 36);
+  const blockedUntil = parseInt(p[3], 36);
+  const nonce = parseInt(p[4], 36);
+  if (
+    ver !== 1 ||
+    !Number.isSafeInteger(window) ||
+    !Number.isSafeInteger(spent) ||
+    !Number.isSafeInteger(blockedUntil) ||
+    !Number.isSafeInteger(nonce)
+  ) {
+    return null;
+  }
+  return { ver, window, spent, blockedUntil, nonce };
 }
 
 export function signReceipt(receipt, key) {
@@ -73,6 +57,7 @@ export function signReceipt(receipt, key) {
 }
 
 export function verifyReceipt(receiptStr, macStr, key) {
+  if (typeof receiptStr !== 'string' || typeof macStr !== 'string' || !key) return null;
   const expect = Buffer.from(signReceipt(receiptStr, key));
   const got = Buffer.from(macStr);
   if (expect.length !== got.length || !crypto.timingSafeEqual(expect, got)) return null;
@@ -88,10 +73,11 @@ export function poeChallenge(subject, window) {
 }
 
 export function hasLeadingZeroBits(buf, bits) {
+  if (bits <= 0) return true;
+  if (bits > buf.length * 8) return false;
   let have = 0;
   for (const byte of buf) {
     if (byte === 0) { have += 8; if (have >= bits) return true; continue; }
-    // count leading zeros of this byte
     let b = byte, z = 0;
     while ((b & 0x80) === 0) { z++; b = (b << 1) & 0xff; }
     have += z;
@@ -105,6 +91,7 @@ export function solvePoE(challenge, bits, maxIter = 1 << 26) {
   challenge.copy(buf, 8);
   for (let i = 0; i < maxIter; i++) {
     buf.writeUInt32BE(i >>> 0, 0);
+    buf.writeUInt32BE(Math.floor(i / 0x100000000) >>> 0, 4);
     const h = crypto.createHash('sha256').update(buf).digest();
     if (hasLeadingZeroBits(h, bits)) return { nonce: i, hash: h };
   }
@@ -112,8 +99,10 @@ export function solvePoE(challenge, bits, maxIter = 1 << 26) {
 }
 
 export function checkPoE(challenge, nonce, bits) {
+  if (!Number.isSafeInteger(nonce) || nonce < 0) return false;
   const buf = Buffer.alloc(8 + challenge.length);
   buf.writeUInt32BE(nonce >>> 0, 0);
+  buf.writeUInt32BE(Math.floor(nonce / 0x100000000) >>> 0, 4);
   challenge.copy(buf, 8);
   return hasLeadingZeroBits(crypto.createHash('sha256').update(buf).digest(), bits);
 }
@@ -131,58 +120,76 @@ export class Limiter {
     this.budget = budget;
     this.windowMs = windowMs;
     this.pressure = pressure;
-    // Aggregate per-network allowance, in multiples of a single instance's
-    // budget. High enough that a normal shared NAT is never throttled, low
-    // enough that "spin up 10k identities from one address" gains nothing.
     this.netMultiplier = netMultiplier;
     this.identityBonus = 2; // verified callers get 3× the anonymous allowance
-    this.netEntries = new Map(); // address → { window, spent }
-    this.entries = new Map(); // subject → { window, spent, blockedUntil, lastNonce, punish }
-    this.stats = { receiptsOk: 0, receiptsMissing: 0, receiptsForged: 0, rejected: 0, poeServed: 0, hmacOps: 0 };
+    this.netEntries = new Map(); // address/grant → { window, spent }
+    this.entries = new Map();    // subject → { window, spent, blockedUntil, lastNonce, punish }
+    this.usedPoe = new Map();    // `${subject}:${poeWin}:${nonce}` → poeWin (anti-replay)
+    this.stats = {
+      receiptsOk: 0, receiptsMissing: 0, receiptsForged: 0,
+      rejected: 0, poeServed: 0, poeRedeemed: 0, hmacOps: 0,
+    };
   }
 
   _entry(subject, now) {
     const window = Math.floor(now / this.windowMs);
     let e = this.entries.get(subject);
-    if (!e || e.window !== window) {
-      e = { window, spent: 0, blockedUntil: 0, lastNonce: -1, punish: e ? e.punish : 0 };
+    if (!e) {
+      e = { window, spent: 0, blockedUntil: 0, lastNonce: -1, punish: 0 };
+      if (this.entries.size >= 200000) this._gc(now);
       this.entries.set(subject, e);
-      if (this.entries.size > 200000) this._gc(now);
+    } else if (e.window !== window) {
+      // Preserve lastNonce & punish across window rollovers so receipts from
+      // older windows cannot be replayed in newer windows.
+      e.window = window;
+      e.spent = 0;
     }
     return e;
   }
 
   _gc(now) {
+    const minWin = Math.floor(now / this.windowMs) - 1;
     for (const [k, v] of this.entries) {
-      if (v.window < Math.floor(now / this.windowMs) - 1) this.entries.delete(k);
+      if (v.window < minWin) this.entries.delete(k);
+    }
+    if (this.entries.size >= 200000) {
+      this.entries.delete(this.entries.keys().next().value);
+    }
+  }
+
+  _gcNet(window) {
+    for (const [k, v] of this.netEntries) {
+      if (v.window < window - 1) this.netEntries.delete(k);
+    }
+    if (this.netEntries.size >= 50000) {
+      this.netEntries.delete(this.netEntries.keys().next().value);
     }
   }
 
   /**
    * Single entry point, four cheap steps, no allocations on the hot path.
-   * Returns {allow, code, retryAfterMs, difficulty, pressure}.
+   * Returns {allow, code, retryAfterMs, difficulty, pressure, budgetRemaining, tier}.
    */
-  check({ subject, net = null, netAllowance = 0, costClass = CLASS.CHEAP, receipt = null, mac = null, sessionKey = null, identityTrusted = false }, now = Date.now()) {
+  check({
+    subject, net = null, netAllowance = 0, costClass = CLASS.CHEAP,
+    receipt = null, mac = null, sessionKey = null, identityTrusted = false,
+  }, now = Date.now()) {
     const pressure = this.pressure();
     const weight = CLASS_WEIGHT[costClass] ?? 1;
     const e = this._entry(subject, now);
     const tier = [];
+    const window = e.window;
 
     // Aggregate key: bounds instance churn for anonymous callers and token
-    // fan-out for identified ones. One integer, no allocation.
+    // fan-out for identified ones.
     if (net) {
-      const window = Math.floor(now / this.windowMs);
       let n = this.netEntries.get(net);
       if (!n || n.window !== window) {
         n = { window, spent: 0 };
+        if (this.netEntries.size >= 50000) this._gcNet(window);
         this.netEntries.set(net, n);
-        if (this.netEntries.size > 50000) this.netEntries.clear();
       }
       n.spent += weight;
-      // For identified callers the aggregate allowance is scaled by maxSubs,
-      // which the ISSUER signed — so an operator with 1000 agents legitimately
-      // gets 1000 shares, while a stolen single-instance token still cannot be
-      // fanned out into a fleet.
       const allowance = netAllowance || this.budget * this.netMultiplier * (identityTrusted ? 1 + this.identityBonus : 1);
       if (n.spent > allowance) {
         tier.push('net');
@@ -198,7 +205,7 @@ export class Limiter {
     // A blocked subject is rejected for free.
     if (e.blockedUntil > now) {
       this.stats.rejected++;
-      return { allow: false, code: 'RATE_LIMITED', retryAfterMs: e.blockedUntil - now, pressure, tier: 'blocked' };
+      return { allow: false, code: 'RATE_LIMITED', retryAfterMs: e.blockedUntil - now, pressure, tier: ['blocked'] };
     }
 
     // Tier 1 — cooperative receipt.
@@ -206,21 +213,30 @@ export class Limiter {
     if (receipt && mac && sessionKey) {
       const r = verifyReceipt(receipt, mac, sessionKey);
       this.stats.hmacOps++;
-      if (!r) { this.stats.receiptsForged++; e.punish = Math.min(e.punish + 1, 6); }
-      else if (r.nonce <= e.lastNonce) { this.stats.receiptsForged++; e.punish = Math.min(e.punish + 1, 6); } // replay / rollback
-      else {
+      if (!r) {
+        this.stats.receiptsForged++;
+        e.punish = Math.min(e.punish + 1, 6);
+      } else if (r.nonce <= e.lastNonce) {
+        this.stats.receiptsForged++;
+        e.punish = Math.min(e.punish + 1, 6); // replay / rollback
+      } else {
         e.lastNonce = r.nonce;
-        // The client's own accounting is authoritative *if it is worse* than ours.
-        if (r.spent > e.spent) e.spent = r.spent;
+        // Only merge reported spend when the receipt belongs to the current window
+        // so boundary-straddling in-flight requests don't pollute the fresh window.
+        if (r.window === window && r.spent > e.spent) e.spent = r.spent;
         if (r.blockedUntil > e.blockedUntil) e.blockedUntil = r.blockedUntil;
         cooperative = true;
         this.stats.receiptsOk++;
         tier.push('cooperative');
-        // Honest client that blocked itself: honour it, but give it free money
-        // when the server is calm. Self-limits should not be sticky.
-        if (r.blockedUntil > now && pressure < 64) {
-          e.blockedUntil = 0;
-          tier.push('relaxed');
+        // Honest client that blocked itself: honour it under load, relax when calm.
+        if (r.blockedUntil > now) {
+          if (pressure < 64) {
+            e.blockedUntil = 0;
+            tier.push('relaxed');
+          } else {
+            this.stats.rejected++;
+            return { allow: false, code: 'RATE_LIMITED', retryAfterMs: e.blockedUntil - now, pressure, tier };
+          }
         }
       }
     } else {
@@ -253,11 +269,59 @@ export class Limiter {
     return {
       allow: true, code: 'OK', pressure,
       budgetRemaining: effective - e.spent,
+      effectiveBudget: effective,
       blockUntilMs: pressure >= 128 ? now + 250 : 0, // tell the client to slow down early
       tier,
     };
   }
 
-  // Server hands this to the client in the handshake so receipts can't be forged.
+  /**
+   * Verify and redeem a single-use Proof-of-Effort solution inline (no recursion).
+   * Credits both the subject bucket and the aggregate net bucket, and prevents
+   * nonce replay within the PoE challenge window.
+   */
+  redeemPoE({ subject, net = null, poeWindow, challenge, nonce, difficulty, costClass = CLASS.CHEAP }, now = Date.now()) {
+    if (!Number.isSafeInteger(nonce) || nonce < 0) return null;
+    const replayKey = `${subject}:${poeWindow}:${nonce}`;
+    if (this.usedPoe.has(replayKey)) return null;
+    if (!checkPoE(challenge, nonce, difficulty)) return null;
+
+    if (this.usedPoe.size >= 50000) {
+      for (const [k, w] of this.usedPoe) {
+        if (w < poeWindow - 1) this.usedPoe.delete(k);
+      }
+      if (this.usedPoe.size >= 50000) this.usedPoe.delete(this.usedPoe.keys().next().value);
+    }
+    this.usedPoe.set(replayKey, poeWindow);
+
+    const weight = CLASS_WEIGHT[costClass] ?? 1;
+    const credit = weight * 4;
+    const e = this._entry(subject, now);
+    // Bring subject back within effective budget and grant headroom for this + 3 more requests
+    const effective = this.budget * (1 + (this.identityBonus ?? 2));
+    e.spent = Math.max(0, Math.min(e.spent, this.budget) - credit);
+    e.blockedUntil = 0;
+
+    if (net) {
+      const n = this.netEntries.get(net);
+      if (n) n.spent = Math.max(0, n.spent - credit);
+    }
+    this.stats.poeRedeemed++;
+    return {
+      allow: true, code: 'OK', pressure: this.pressure(),
+      budgetRemaining: Math.max(0, this.budget - e.spent),
+      effectiveBudget: effective,
+      blockUntilMs: 0,
+      tier: ['poe'],
+    };
+  }
+
+  // Per-connection random session key.
   static sessionKey() { return crypto.randomBytes(32); }
+
+  // Stateless cluster session key (spec §12.1): any edge node sharing `clusterSecret`
+  // can issue and verify receipt MACs for `peerId` without sticky sessions.
+  static deriveSessionKey(clusterSecret, peerId) {
+    return crypto.createHmac('sha256', clusterSecret).update('h4-rl-v1|').update(String(peerId)).digest();
+  }
 }

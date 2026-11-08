@@ -7,3 +7,4 @@ export { H4Server } from './server.js';
 export { H4Client } from './client.js';
 export * from './wire.js';
 export * from './varint.js';
+export * from './gateway.js';

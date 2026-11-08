@@ -1,25 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// H4 client — including the part nobody else ships: an honest local accountant.
+// H4 client — including an honest local accountant and online cost learner.
 //
 // The client is not a victim of rate limiting, it is a *participant*. It keeps
-// its own budget book, predicts cost before sending, and cancels requests that
-// cannot be afforded. On a well-behaved fleet this removes the majority of
-// would-be 429s from the wire entirely — the server never sees the traffic, so
-// there is nothing to defend against and nothing to pay for.
-//
-// It also does the defensive half: replay protection, token budget ceilings,
-// and refusal to send a request whose predicted cost exceeds what the response
-// could possibly be worth. (An agent that cannot evaluate worth is an agent
-// that will be mined as a DoS amplifier.)
+// its own budget book, predicts cost before sending (learning from RESULT's
+// signed cost_asym over time), embeds signed `h4-rl` receipts on the wire, and
+// cancels requests that cannot be afforded before bytes enter the network.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import crypto from 'node:crypto';
 import {
   encodeIntent, encodeCost, encodeCap, encodeHeadersFrame, encodeData,
-  decodeResult, decodeRate, decodeCost, decodeReject, decodeHeadersFrame,
-  iterFrames, F, CLASS, MODE, CAPS,
+  decodeResult, decodeRate, decodeCost, decodeReject, decodeHeadersFrame, decodeAccess,
+  iterFrames, F, CLASS, MODE,
 } from './frames.js';
-import { encodeReceipt, signReceipt, solvePoE, decodeReceipt } from './limits.js';
+import { encodeReceipt, signReceipt, solvePoE, CLASS_WEIGHT } from './limits.js';
 
 export class H4Client {
   constructor({
@@ -40,10 +34,8 @@ export class H4Client {
     this.log = log;
     this.respectCeilings = respectCeilings;
     this.keyPair = key ?? crypto.generateKeyPairSync('ed25519');
+    this.learnedBias = new Map(); // `${method} ${path}` → EMA of costAsym
 
-    // `spent` is what we have told the server; `reserved` is what we have
-    // decided to send but not yet built. Both must count, otherwise a caller
-    // that asks "may I?" in a loop gets "yes" forever.
     this.state = { window: 0, spent: 0, reserved: 0, blockedUntil: 0, nonce: 0 };
     this.stats = {
       sent: 0, sentVirtually: 0, selfBlocked: 0, costAvoided: 0,
@@ -53,13 +45,7 @@ export class H4Client {
   }
 
   /**
-   * Adopt the server's advertised quota at/after handshake.
-   *
-   * DESIGN REQUIREMENT (spec §6.4): a client must never guess its budget. If it
-   * does, honest accounting and server accounting diverge, and the honest client
-   * is the one that gets throttled — the worst possible outcome for a
-   * "cooperative" scheme. The server therefore provisions the client, and the
-   * client's receipts are expressed in the same units the server enforces.
+   * Adopt the server's advertised quota at/after handshake (spec §6.4).
    */
   provision({ budget, windowMs, refillPerSec }) {
     if (windowMs) this.windowMs = windowMs;
@@ -73,28 +59,42 @@ export class H4Client {
 
   _roll() {
     const w = this.window;
-    if (this.state.window !== w) { this.state.window = w; this.state.spent = 0; this.state.reserved = 0; }
+    if (this.state.window !== w) {
+      this.state.window = w;
+      this.state.spent = 0;
+      this.state.reserved = 0;
+    }
   }
 
   /** Honest accounting + the receipt the server will check with one HMAC. */
-  _receipt(costWeight) {
+  _receipt(weight) {
     this._roll();
-    this.state.spent += costWeight;
-    this.state.reserved = Math.max(0, this.state.reserved - costWeight);
-    this.state.nonce = (this.state.nonce + 1) & 0x7fffffff;
+    this.state.spent += weight;
+    this.state.reserved = Math.max(0, this.state.reserved - weight);
+    this.state.nonce += 1;
     const receipt = encodeReceipt({
-      window: this.state.window, spent: this.state.spent,
-      blockedUntil: Math.floor(this.state.blockedUntil / 1000), nonce: this.state.nonce,
+      window: this.state.window,
+      spent: this.state.spent,
+      blockedUntil: this.state.blockedUntil,
+      nonce: this.state.nonce,
     });
     const mac = this.sessionKey ? signReceipt(receipt, this.sessionKey) : '';
     return { receipt, mac, spent: this.state.spent };
+  }
+
+  /** Predict request cost using static model + online learned `costAsym` EMA. */
+  predictCost({ path = '/', method = 'GET', intent, cost } = {}) {
+    const m = method.toUpperCase();
+    const base = predict(m, intent, cost);
+    const bias = this.learnedBias.get(`${m} ${path}`) ?? 0;
+    return Math.max(1, Math.round(base + bias));
   }
 
   /**
    * Decide *before* sending. Returns null if the request is affordable, or a
    * reason object if the client should not send it at all.
    */
-  shouldSend({ path, method = 'GET', intent, cost, worth = 0 }) {
+  shouldSend({ path = '/', method = 'GET', intent, cost, worth = 0 }) {
     this._roll();
     const now = Date.now();
     if (this.state.blockedUntil > now) {
@@ -104,13 +104,12 @@ export class H4Client {
     }
     const w = costWeight(method, intent, cost);
     if (this.state.spent + this.state.reserved + w > this.budget) {
-      // Self-block rather than get 429'd. The server never learns we existed.
       this.state.blockedUntil = (this.state.window + 1) * this.windowMs;
       this.stats.selfBlocked++;
       this.stats.costAvoided += w;
       return { send: false, reason: 'budget', retryAfterMs: this.state.blockedUntil - now };
     }
-    const predicted = predict(method, intent, cost);
+    const predicted = this.predictCost({ path, method, intent, cost });
     if (this.respectCeilings && worth && predicted > worth) {
       this.stats.selfBlocked++;
       this.stats.costAvoided += predicted;
@@ -119,89 +118,142 @@ export class H4Client {
     if (intent?.maxShape && intent.maxShape > this.maxTokenBudget) {
       return { send: false, reason: 'shape-over-budget' };
     }
-    this.state.reserved += w; // committed: the caller will now build & send
+    this.state.reserved += w;
     return null;
   }
 
-  /** Build the first flight: HEADERS + INTENT + COST (+ CAP). One RTT. */
-  build({ path, method = 'GET', headers = [], intent = {}, cost = {}, cap = null, body = null }) {
-    const w = costWeight(method, intent, cost);
-    const parts = [];
+  /** Build the first flight: HEADERS (incl. h4-rl / h4-effort) + INTENT + COST (+ CAP + DATA). */
+  build({ path, method = 'GET', headers = [], intent = {}, cost = {}, cap = null, body = null, effortNonce = undefined }) {
+    const m = method.toUpperCase();
+    const effectiveClass = classifyCost(m, intent, cost);
+    const w = CLASS_WEIGHT[effectiveClass] ?? 1;
+    const { receipt, mac } = this._receipt(w);
+
+    const hasRl = headers.some(([k]) => k.toLowerCase() === 'h4-rl');
+    const hasEffort = headers.some(([k]) => k.toLowerCase() === 'h4-effort');
     const hdrs = [
-      [':method', method], [':path', path], [':scheme', 'https'],
+      [':method', m],
+      [':path', path],
+      [':scheme', 'https'],
       ...headers,
     ];
-    parts.push(encodeHeadersFrame(hdrs));
-    parts.push(encodeIntent({ mode: MODE.QUERY, ...intent }));
-    parts.push(encodeCost({ costClass: CLASS.NORMAL, ...cost }));
+    if (this.sessionKey && mac && !hasRl) {
+      hdrs.push(['h4-rl', `${receipt},${mac}`]);
+    }
+    if (effortNonce !== undefined && !hasEffort) {
+      hdrs.push(['h4-effort', String(effortNonce)]);
+    }
+
+    const parts = [
+      encodeHeadersFrame(hdrs),
+      encodeIntent({ mode: MODE.QUERY, ...intent }),
+      encodeCost({ costClass: effectiveClass, ...cost }),
+    ];
     if (cap) parts.push(encodeCap(cap));
-    if (body) parts.push(encodeData(body));
-    const { receipt, mac } = this._receipt(w);
-    return Buffer.concat(parts).length + receipt.length + mac.length > 0
-      ? { frames: Buffer.concat(parts), receipt, mac, virtualWeight: w }
-      : null;
+    if (body !== null && body !== undefined) parts.push(encodeData(body));
+
+    const frames = Buffer.concat(parts);
+    this.stats.sent++;
+    this.stats.bytesOut += frames.length;
+    return { frames, receipt, mac, virtualWeight: w };
   }
 
-  /** Client-side view of a response: does the server agree with our model? */
-  observe(respFrames) {
-    const out = { result: null, rate: null, cost: null, headers: [], reject: null, body: Buffer.alloc(0) };
+  /** Client-side view of a response: decode frames, adopt rate policy, and learn cost_asym. */
+  observe(respFrames, { path = null, method = 'GET' } = {}) {
+    this.stats.bytesIn += respFrames.length;
+    const out = {
+      result: null, rate: null, cost: null, headers: [],
+      reject: null, access: null, body: Buffer.alloc(0),
+    };
+    const bodyChunks = [];
     for (const f of iterFrames(respFrames)) {
       switch (f.type) {
         case F.RESULT: out.result = decodeResult(f.payload); break;
         case F.RATE: out.rate = decodeRate(f.payload); break;
         case F.COST: out.cost = decodeCost(f.payload); break;
         case F.HEADERS: out.headers = decodeHeadersFrame(f.payload); break;
+        case F.ACCESS: out.access = decodeAccess(f.payload); break;
         case F.REJECT:
           out.reject = decodeReject(f.payload);
           if (out.reject.code === 1) this.stats.rateLimited++;
           if (out.reject.code === 10) this.stats.deferred++;
           break;
-        case F.DATA: out.body = Buffer.concat([out.body, f.payload]); break;
+        case F.DATA: bodyChunks.push(f.payload); break;
         default: break;
       }
     }
-    this._applyPolicy(out);
+    if (bodyChunks.length === 1) out.body = Buffer.from(bodyChunks[0]);
+    else if (bodyChunks.length > 1) out.body = Buffer.concat(bodyChunks);
+
+    this._applyPolicy(out, path, method);
     return out;
   }
 
-  _applyPolicy(out) {
+  _applyPolicy(out, path, method) {
     if (out.rate) {
-      // Adopt the server's policy eagerly. This is the whole trick: the client
-      // stops before the server has to say no again.
-      if (out.rate.budgetRemaining !== undefined) {
-        this._roll();
-        this.state.spent = Math.max(this.state.spent, this.budget - out.rate.budgetRemaining);
+      this._roll();
+      if (out.rate.budgetRemaining === 0) {
+        this.state.spent = Math.max(this.state.spent, this.budget);
+      } else if (out.rate.budgetRemaining !== undefined && out.rate.refillPerSec > 0) {
+        const serverWindowBudget = Math.round(out.rate.refillPerSec * (this.windowMs / 1000));
+        const serverSpent = Math.max(0, serverWindowBudget - out.rate.budgetRemaining);
+        this.state.spent = Math.max(this.state.spent, serverSpent);
       }
-      if (out.rate.blockUntilMs) this.state.blockedUntil = Math.max(this.state.blockedUntil, out.rate.blockUntilMs);
+      if (out.rate.blockUntilMs) {
+        this.state.blockedUntil = Math.max(this.state.blockedUntil, out.rate.blockUntilMs);
+      }
     }
     if (out.reject) {
-      if (out.reject.retryAfterMs) this.state.blockedUntil = Math.max(this.state.blockedUntil, Date.now() + out.reject.retryAfterMs);
-      if (out.reject.code === 2 || out.reject.code === 4) this.state.blockedUntil = Date.now() + 30_000;
+      if (out.reject.retryAfterMs) {
+        this.state.blockedUntil = Math.max(this.state.blockedUntil, Date.now() + out.reject.retryAfterMs);
+      }
+      if (out.reject.code === 2 || out.reject.code === 4) {
+        this.state.blockedUntil = Math.max(this.state.blockedUntil, Date.now() + 30_000);
+      }
     }
-    if (out.result?.memoReuse) this.stats.memoReuse = (this.stats.memoReuse ?? 0) + out.result.memoReuse;
+    if (out.result) {
+      if (out.result.memoReuse) {
+        this.stats.memoReuse = (this.stats.memoReuse ?? 0) + out.result.memoReuse;
+      }
+      if (path && Number.isFinite(out.result.costAsym) && out.result.cache === 0) {
+        // Learn from actual execution (CACHE.MISS), not 1-unit cache hits
+        const rk = `${method.toUpperCase()} ${path}`;
+        const prev = this.learnedBias.get(rk) ?? 0;
+        if (this.learnedBias.size >= 2048 && !this.learnedBias.has(rk)) {
+          this.learnedBias.delete(this.learnedBias.keys().next().value);
+        }
+        this.learnedBias.set(rk, 0.7 * prev + 0.3 * out.result.costAsym);
+      }
+    }
   }
 
-  /** Needed when the server escalates to effort: pay once, cache the nonce. */
+  /** Needed when the server escalates to effort: solve PoE challenge. */
   payEffort(difficulty) {
     const t0 = process.hrtime.bigint();
-    const { nonce } = solvePoE(difficulty.challenge, difficulty.bits) ?? {};
+    const sol = solvePoE(difficulty.challenge, difficulty.bits);
+    this.stats.poeMs += Number(process.hrtime.bigint() - t0) / 1e6;
+    if (!sol) return null;
     this.stats.poeSolved++;
     this.stats.poeBits += difficulty.bits;
-    this.stats.poeMs += Number(process.hrtime.bigint() - t0) / 1e6;
-    return nonce;
+    return sol.nonce;
   }
+}
+
+function classifyCost(method, intent, cost) {
+  if (cost?.costClass !== undefined && cost.costClass !== CLASS.CHEAP) return cost.costClass;
+  if (cost?.costClass === CLASS.CHEAP && cost && 'costClass' in cost) return CLASS.CHEAP;
+  if (intent?.mode === MODE.MUTATE) return CLASS.EXPENSIVE;
+  const m = method.toUpperCase();
+  if (m === 'GET' || m === 'HEAD' || m === 'SUB') return CLASS.CHEAP;
+  return CLASS.NORMAL;
 }
 
 function costWeight(method, intent, cost) {
-  if (cost?.costClass === CLASS.EXPENSIVE) return 60;
-  if (cost?.costClass === CLASS.NORMAL) return 5;
-  if (method === 'GET' || method === 'HEAD') return 1;
-  if (method === 'SUB') return 1;
-  return 5;
+  return CLASS_WEIGHT[classifyCost(method, intent, cost)] ?? 1;
 }
 
 function predict(method, intent, cost) {
-  const base = method === 'GET' ? 1 : method === 'SUB' ? 1 : 8;
+  const base = method === 'GET' || method === 'HEAD' || method === 'SUB' ? 1 : 8;
   const shape = intent?.maxShape ? Math.min(intent.maxShape, 64) : 1;
-  return Math.max(cost?.predicted || 0, base) + (method === 'GET' ? 0 : shape >> 2);
+  return Math.max(cost?.predicted || 0, base) + (method === 'GET' || method === 'HEAD' ? 0 : shape >> 2);
 }
