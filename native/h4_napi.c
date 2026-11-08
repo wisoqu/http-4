@@ -1,7 +1,24 @@
 #define NAPI_VERSION 8
+#include <math.h>
 #include <node_api.h>
 #include <string.h>
 #include "h4_core.h"
+
+#define H4_MAX_SAFE_INT_D 9007199254740991.0
+
+static int parse_safe_u64(double d, uint64_t *out) {
+  if (!isfinite(d) || d < 0.0 || d > H4_MAX_SAFE_INT_D || floor(d) != d) {
+    return 0;
+  }
+  *out = (uint64_t)d;
+  return 1;
+}
+
+static uint64_t clamp_iter_u64(double d) {
+  if (!isfinite(d) || d <= 0.0) return 0;
+  if (d > H4_MAX_SAFE_INT_D) return UINT64_C(9007199254740991);
+  return (uint64_t)floor(d);
+}
 
 #define NAPI_CHECK(env, expr)                                            \
   do {                                                                   \
@@ -56,7 +73,7 @@ static napi_value napi_solve_poe(napi_env env, napi_callback_info info) {
   double max_iter_d = 0;
   NAPI_CHECK(env, napi_get_value_uint32(env, argv[1], &bits));
   NAPI_CHECK(env, napi_get_value_double(env, argv[2], &max_iter_d));
-  uint64_t max_iter = max_iter_d > 0 ? (uint64_t)max_iter_d : 0;
+  uint64_t max_iter = clamp_iter_u64(max_iter_d);
 
   uint64_t nonce = 0;
   uint8_t hash[H4_SHA256_LEN];
@@ -92,12 +109,13 @@ static napi_value napi_check_poe(napi_env env, napi_callback_info info) {
   uint32_t bits = 0;
   NAPI_CHECK(env, napi_get_value_double(env, argv[1], &nonce_d));
   NAPI_CHECK(env, napi_get_value_uint32(env, argv[2], &bits));
-  if (nonce_d < 0 || nonce_d > 9007199254740991.0) {
+  uint64_t nonce_u64 = 0;
+  if (!parse_safe_u64(nonce_d, &nonce_u64)) {
     napi_value f;
     NAPI_CHECK(env, napi_get_boolean(env, false, &f));
     return f;
   }
-  int ok = h4_poe_verify(chal, chal_len, (uint64_t)nonce_d, bits);
+  int ok = h4_poe_verify(chal, chal_len, nonce_u64, bits);
   napi_value res;
   NAPI_CHECK(env, napi_get_boolean(env, ok != 0, &res));
   return res;
@@ -116,8 +134,13 @@ static napi_value napi_memhard_hash(napi_env env, napi_callback_info info) {
   }
   double nonce_d = 0;
   NAPI_CHECK(env, napi_get_value_double(env, argv[1], &nonce_d));
+  uint64_t nonce_u64 = 0;
+  if (!parse_safe_u64(nonce_d, &nonce_u64)) {
+    napi_throw_range_error(env, NULL, "nonce must be a non-negative safe integer");
+    return NULL;
+  }
   uint8_t digest[H4_SHA256_LEN];
-  h4_memhard_hash(chal, chal_len, (uint64_t)(nonce_d > 0 ? nonce_d : 0), digest);
+  h4_memhard_hash(chal, chal_len, nonce_u64, digest);
   napi_value out;
   void *dst = NULL;
   NAPI_CHECK(env, napi_create_buffer_copy(env, H4_SHA256_LEN, digest, &dst, &out));
@@ -141,7 +164,7 @@ static napi_value napi_solve_memhard(napi_env env, napi_callback_info info) {
   NAPI_CHECK(env, napi_get_value_double(env, argv[2], &max_iter_d));
   uint64_t nonce = 0;
   uint8_t hash[H4_SHA256_LEN];
-  if (!h4_memhard_solve(chal, chal_len, bits, max_iter_d > 0 ? (uint64_t)max_iter_d : 0, &nonce, hash)) {
+  if (!h4_memhard_solve(chal, chal_len, bits, clamp_iter_u64(max_iter_d), &nonce, hash)) {
     napi_value null_val;
     NAPI_CHECK(env, napi_get_null(env, &null_val));
     return null_val;
@@ -172,12 +195,13 @@ static napi_value napi_check_memhard(napi_env env, napi_callback_info info) {
   uint32_t bits = 0;
   NAPI_CHECK(env, napi_get_value_double(env, argv[1], &nonce_d));
   NAPI_CHECK(env, napi_get_value_uint32(env, argv[2], &bits));
-  if (nonce_d < 0 || nonce_d > 9007199254740991.0) {
+  uint64_t nonce_u64 = 0;
+  if (!parse_safe_u64(nonce_d, &nonce_u64)) {
     napi_value f;
     NAPI_CHECK(env, napi_get_boolean(env, false, &f));
     return f;
   }
-  int ok = h4_memhard_verify(chal, chal_len, (uint64_t)nonce_d, bits);
+  int ok = h4_memhard_verify(chal, chal_len, nonce_u64, bits);
   napi_value res;
   NAPI_CHECK(env, napi_get_boolean(env, ok != 0, &res));
   return res;

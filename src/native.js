@@ -16,7 +16,8 @@ const addonPath = path.join(root, 'native', 'bin', 'h4_native.node');
 const require = createRequire(import.meta.url);
 
 let binding = null;
-if (process.env.H4_PURE_JS !== '1') {
+const skipNative = process.env.H4_PURE_JS === '1' || process.env.H4_SKIP_NATIVE === '1';
+if (!skipNative) {
   try {
     if (!fs.existsSync(addonPath)) {
       buildNative({ quiet: true });

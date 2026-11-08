@@ -395,7 +395,8 @@ export class Limiter {
   }
 
   /**
-   * Redeem a single-use cryptographic `h4-pass` token in ~2 µs (0 client CPU burn).
+   * Redeem a single-use cryptographic `h4-pass` overload token (0 client CPU burn;
+   * issuer-linkable HMAC192, not RFC 9576–9578 blind Privacy Pass).
    */
   redeemPass({ subject, net = null, passToken, costClass = CLASS.CHEAP }, now = Date.now()) {
     if (!this.passIssuer || !passToken) return null;
