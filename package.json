@@ -1,0 +1,17 @@
+{
+  "name": "http4",
+  "version": "0.1.0",
+  "description": "HTTP/4 — agent-native, cost-aware, DoS-resistant evolution of HTTP over QUIC. Reference implementation (semantics layer) + specification.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node test/run.js",
+    "bench": "node bench/bench.js",
+    "scenario": "node demo.js",
+    "server": "node src/server.js",
+    "attack": "node bench/attack-sim.js"
+  },
+  "keywords": ["http4", "quic", "protocol", "agents", "ddos", "qpack", "capabilities"],
+  "license": "CC-BY-4.0 / MIT",
+  "engines": { "node": ">=20" }
+}
