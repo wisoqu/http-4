@@ -5,19 +5,19 @@
 //   security checks are ordered by ascending cost, and every check that can be
 //   answered "no" without touching the origin does so.
 //
-//   0. structural + header check  ~100 ns   (anti-smuggling, path validation)
-//   1. capability verify          ~4-13 µs  (HMAC chain; root sig cached)
-//   2. limit check + inline PoE   ~0.1-4 µs (receipt HMAC / bucket / 1 SHA-256)
-//   3. scope & capability gate    ~200 ns   (segment-safe path containment)
-//   4. cost & deadline gate       ~200 ns   (table + EMA estimate)
-//   5. dedup /idem / coalesce     ~1 µs     (singleflight + tenant-bound cache)
-//   6. handler                    expensive ← nothing hostile reaches here
+//   0. structural + header + 0-RTT check  ~100 ns   (anti-smuggling, replay guard)
+//   1. capability verify                  ~1-4 µs   (C11 HMAC chain; root cached)
+//   2. limit + h4-pass + inline PoE       ~0.1-3 µs (receipt / pass / C11 PoE)
+//   3. scope & capability gate            ~200 ns   (segment-safe containment)
+//   4. cost & deadline gate               ~200 ns   (table + EMA estimate)
+//   5. dedup / idem / coalesce / stream   ~1 µs     (singleflight or live stream)
+//   6. handler                            expensive ← nothing hostile reaches here
 // ─────────────────────────────────────────────────────────────────────────────
 
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
-  F, REJECT, CLASS, MODE, CACHE,
+  REJECT, CLASS, MODE, CACHE,
   encodeResult, encodeRate, encodeReject, encodeHeadersFrame, encodeData, encodeCost, encodeAccess,
 } from './frames.js';
 import { verify, KeyRegistry, verifyCache, CAPS, isValidPath, isSubScope } from './identity.js';
@@ -25,6 +25,35 @@ import { Limiter, poeChallenge } from './limits.js';
 import { H4Cache } from './cache.js';
 
 const DEADLINE_EXCEEDED = Symbol('DEADLINE_EXCEEDED');
+
+/**
+ * Canonicalize peer IP addresses so dual-stack callers (`::ffff:203.0.113.5` vs
+ * `203.0.113.5`) share one aggregate network bucket and cannot double anonymous quota.
+ */
+export function normalizePeerIp(ip) {
+  if (!ip || typeof ip !== 'string') return 'anon';
+  let s = ip.trim();
+  const zoneIdx = s.indexOf('%');
+  if (zoneIdx !== -1) s = s.slice(0, zoneIdx);
+  const lower = s.toLowerCase();
+  if (lower.startsWith('::ffff:')) {
+    const v4 = s.slice(7);
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v4)) return v4;
+  }
+  return lower || 'anon';
+}
+
+function isAsyncIterable(v) {
+  return v !== null && typeof v === 'object' && typeof v[Symbol.asyncIterator] === 'function';
+}
+
+function hasControlChars(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0 || c === 10 || c === 13) return true;
+  }
+  return false;
+}
 
 export class H4Server {
   constructor({
@@ -44,20 +73,27 @@ export class H4Server {
     this.requireCap = requireCap;
     this.emitAccess = emitAccess;
     this.verifyCache = verifyCache;
-    this.routeCosts = new Map(); // `${method} ${pathname}` → learned EMA of costActual
-    this.idemStore = new Map();  // `${tenantOrSubj}|${method}|${rawPath}|${idem}` → { expiresAt, payload, tokens, memoReuse, costActual }
+    this.routeCosts = new Map();
+    this.idemStore = new Map();
     this.metrics = {
-      requests: 0, served: 0, rejected: 0, coalesced: 0, cacheHits: 0,
-      capVerifies: 0, poeChecks: 0, costPredicted: 0, bytesIn: 0, bytesOut: 0,
+      requests: 0, served: 0, streamed: 0, streamCancelled: 0, rejected: 0,
+      coalesced: 0, cacheHits: 0, capVerifies: 0, poeChecks: 0, passRedeemed: 0,
+      costPredicted: 0, bytesIn: 0, bytesOut: 0,
       savedByCacheMs: 0, savedByCoalesceMs: 0, deferred: 0, idempotentReplays: 0,
     };
   }
 
+  /** Register a unary or streaming route handler. */
+  route(method, path, handler) {
+    this.routes[`${method.toUpperCase()} ${path}`] = handler;
+    return this;
+  }
+
   /**
-   * Full request handling. Everything is synchronous except cache-miss handler
-   * execution, so the reject and cache-hit paths never yield the event loop.
+   * Shared pre-handler security & admission pipeline (steps 0..4).
+   * Guarantees identical enforcement for unary `handle()` and streaming `handleStream()`.
    */
-  async handle(req, now = Date.now()) {
+  _admit(req, now) {
     this.metrics.requests++;
     if (req.byteLength) this.metrics.bytesIn += req.byteLength;
     else if (req.body) this.metrics.bytesIn += Buffer.byteLength(req.body);
@@ -65,19 +101,31 @@ export class H4Server {
     // ── 0. structural & anti-smuggling validation ───────────────────────────
     const headers = req.headers ?? [];
     if (!Array.isArray(headers) || headers.length > 256) {
-      return this._reject(REJECT.MALFORMED, 'invalid headers');
+      return { ok: false, response: this._reject(REJECT.MALFORMED, 'invalid headers') };
     }
     const h = Object.create(null);
     let seenRegularHeader = false;
+    let totalHeaderBytes = 0;
     for (let i = 0; i < headers.length; i++) {
       const pair = headers[i];
-      if (!pair || typeof pair[0] !== 'string') return this._reject(REJECT.MALFORMED, 'bad header entry');
+      if (!pair || typeof pair[0] !== 'string') {
+        return { ok: false, response: this._reject(REJECT.MALFORMED, 'bad header entry') };
+      }
       const k = pair[0];
       const v = typeof pair[1] === 'string' ? pair[1] : String(pair[1] ?? '');
-      if (k.length === 0) return this._reject(REJECT.MALFORMED, 'empty header name');
-      if (k.charCodeAt(0) === 58) { // ':' pseudo-header
-        if (seenRegularHeader) return this._reject(REJECT.MALFORMED, 'pseudo-header after regular header');
-        if (k in h) return this._reject(REJECT.MALFORMED, `duplicate pseudo-header ${k}`);
+      if (k.length === 0 || k.length > 256) {
+        return { ok: false, response: this._reject(REJECT.MALFORMED, 'invalid header name length') };
+      }
+      totalHeaderBytes += k.length + v.length;
+      if (totalHeaderBytes > 32 * 1024) {
+        return { ok: false, response: this._reject(REJECT.MALFORMED, 'header block exceeds 32KB') };
+      }
+      if (hasControlChars(k) || hasControlChars(v)) {
+        return { ok: false, response: this._reject(REJECT.MALFORMED, 'control char in header') };
+      }
+      if (k.charCodeAt(0) === 58) {
+        if (seenRegularHeader) return { ok: false, response: this._reject(REJECT.MALFORMED, 'pseudo-header after regular header') };
+        if (k in h) return { ok: false, response: this._reject(REJECT.MALFORMED, `duplicate pseudo-header ${k}`) };
       } else {
         seenRegularHeader = true;
       }
@@ -86,45 +134,59 @@ export class H4Server {
 
     const rawPath = h[':path'] ?? '/';
     if (typeof rawPath !== 'string' || rawPath.length === 0 || rawPath.length > 8192) {
-      return this._reject(REJECT.MALFORMED, 'bad path');
+      return { ok: false, response: this._reject(REJECT.MALFORMED, 'bad path') };
     }
     const qIdx = rawPath.indexOf('?');
     const pathname = qIdx === -1 ? rawPath : rawPath.slice(0, qIdx);
     const query = qIdx === -1 ? '' : rawPath.slice(qIdx + 1);
     if (!isValidPath(pathname)) {
-      return this._reject(REJECT.MALFORMED, 'invalid or traversal path');
+      return { ok: false, response: this._reject(REJECT.MALFORMED, 'invalid or traversal path') };
     }
 
     const method = (h[':method'] ?? 'GET').toUpperCase();
     const intent = req.intent ?? { mode: MODE.QUERY, idem: '', deadlineMs: 30_000, costCeiling: 0, maxShape: 0, dedup: '' };
     const cost = req.cost ?? { predicted: 0, costClass: CLASS.CHEAP, effortBits: 0, budgetRemaining: 0, value: 0, tokenBudget: 0 };
     const cap = req.cap ?? null;
+    const earlyData = Boolean(req.earlyData || h['early-data'] === '1');
+
+    // ── 0b. 0-RTT replay guard (RFC 8470 semantics) ─────────────────────────
+    if (earlyData) {
+      const safeFor0Rtt = (method === 'GET' || method === 'HEAD') && intent.mode !== MODE.MUTATE;
+      if (!safeFor0Rtt && !intent.idem) {
+        this.metrics.deferred++;
+        return { ok: false, response: this._reject(REJECT.DEFERRED, '0rtt-unsafe-mutate', 0) };
+      }
+    }
 
     // ── 1. identity (only if a token is present, or required) ───────────────
     let identity = null;
+    if (h['h4-cap'] && h['h4-cap'].length > 11000) {
+      return { ok: false, response: this._reject(REJECT.MALFORMED, 'oversized h4-cap header') };
+    }
     const rawToken = cap?.token?.length
       ? cap.token
       : (h['h4-cap'] ? Buffer.from(h['h4-cap'], 'base64url') : null);
     if (rawToken && rawToken.length) {
       this.metrics.capVerifies++;
       const v = verify(rawToken, this.registry, { now, cache: this.verifyCache, required: 0 });
-      if (!v.ok) return this._reject(REJECT[v.code] ?? REJECT.CAP_INVALID, v.why);
+      if (!v.ok) return { ok: false, response: this._reject(REJECT[v.code] ?? REJECT.CAP_INVALID, v.why) };
       identity = v;
     } else if (this.requireCap) {
-      return this._reject(REJECT.CAP_INVALID, 'capability required');
+      return { ok: false, response: this._reject(REJECT.CAP_INVALID, 'capability required') };
     }
 
-    // ── limiting keys ───────────────────────────────────────────────────────
+    // ── limiting keys (with IPv4-mapped IPv6 canonicalization) ──────────────
+    const peerNorm = req.peer ? normalizePeerIp(req.peer) : null;
     const instanceId = h['h4-agent-instance'] || '';
     const subject = identity
       ? crypto.createHash('sha256').update(`${identity.subject}|${instanceId}`).digest('hex').slice(0, 16)
-      : this._subjectFromRequest(req, h);
-    const net = identity ? identity.grant : (req.peer ?? null);
+      : this._subjectFromRequest(peerNorm, h);
+    const net = identity ? identity.grant : peerNorm;
     const netAllowance = identity
       ? this.limiter.budget * (1 + this.limiter.identityBonus) * Math.max(1, Math.min(identity.maxSubs || 1, 4096))
       : 0;
 
-    // ── 2. limits (cooperative receipt → enforced bucket → inline PoE) ──────
+    // ── 2. limits (cooperative receipt → enforced → h4-pass → inline PoE) ───
     let rl = req.rate ?? null;
     if (!rl && h['h4-rl']) {
       const comma = h['h4-rl'].indexOf(',');
@@ -133,73 +195,94 @@ export class H4Server {
     const effortNonce = req.effortNonce !== undefined
       ? req.effortNonce
       : (h['h4-effort'] !== undefined && h['h4-effort'] !== '' ? Number(h['h4-effort']) : undefined);
+    const passToken = req.pass ?? h['h4-pass'] ?? null;
 
     const costClass = this._classify(pathname, method, intent, cost);
     let limit = this.limiter.check({
       subject, net, netAllowance, costClass,
       receipt: rl?.receipt, mac: rl?.mac, sessionKey: req.sessionKey ?? null,
-      identityTrusted: !!identity,
+      identityTrusted: !!identity, earlyData,
     }, now);
 
     if (!limit.allow) {
       if (limit.code === 'EFFORT_REQUIRED') {
-        this.metrics.poeChecks++;
-        const poeWindow = Math.floor(now / 30_000);
-        const ch = poeChallenge(subject, poeWindow);
-        const redeemed = effortNonce !== undefined
-          ? this.limiter.redeemPoE({
-              subject, net, poeWindow, challenge: ch,
-              nonce: effortNonce, difficulty: limit.difficulty, costClass,
-            }, now)
+        // Tier 3a: zero-CPU single-use pass bypass (`h4-pass`)
+        const passAdmit = passToken
+          ? this.limiter.redeemPass({ subject, net, passToken, costClass }, now)
           : null;
-        if (redeemed) {
-          limit = redeemed;
+        if (passAdmit) {
+          this.metrics.passRedeemed++;
+          limit = passAdmit;
         } else {
-          this.metrics.rejected++;
-          return {
-            reject: { code: REJECT.EFFORT_REQUIRED, difficulty: limit.difficulty, retryAfterMs: 0, detail: ch.toString('base64url') },
-            frames: [encodeReject(REJECT.EFFORT_REQUIRED, { difficulty: limit.difficulty, detail: ch.toString('base64url') })],
-            rate: null, cost: 0,
-          };
+          // Tier 3b: inline Proof-of-Effort (`sha256` or 4 KB `memhard`)
+          this.metrics.poeChecks++;
+          const poeMode = limit.poeMode ?? this.limiter.poeMode ?? 'sha256';
+          const poeWindow = Math.floor(now / 30_000);
+          const ch = poeChallenge(subject, poeWindow, poeMode);
+          const redeemed = effortNonce !== undefined
+            ? this.limiter.redeemPoE({
+                subject, net, poeWindow, challenge: ch,
+                nonce: effortNonce, difficulty: limit.difficulty, costClass, mode: poeMode,
+              }, now)
+            : null;
+          if (redeemed) {
+            limit = redeemed;
+          } else {
+            this.metrics.rejected++;
+            const chStr = poeMode === 'memhard'
+              ? `mh:${ch.toString('base64url')}`
+              : ch.toString('base64url');
+            return {
+              ok: false,
+              response: {
+                reject: { code: REJECT.EFFORT_REQUIRED, difficulty: limit.difficulty, retryAfterMs: 0, detail: chStr, poeMode },
+                frames: [encodeReject(REJECT.EFFORT_REQUIRED, { difficulty: limit.difficulty, detail: chStr })],
+                rate: null, cost: 0,
+              },
+            };
+          }
         }
       } else {
         this.metrics.rejected++;
         return {
-          reject: { code: REJECT.RATE_LIMITED, retryAfterMs: limit.retryAfterMs, difficulty: 0, detail: '' },
-          frames: [encodeReject(REJECT.RATE_LIMITED, { retryAfterMs: limit.retryAfterMs })],
-          rate: encodeRate({
-            pressure: limit.pressure, budgetRemaining: 0,
-            refillPerSec: Math.floor(this.limiter.budget / (this.limiter.windowMs / 1000)),
-            blockUntilMs: now + limit.retryAfterMs, penaltyMs: limit.retryAfterMs,
-          }),
-          cost: 0,
+          ok: false,
+          response: {
+            reject: { code: REJECT.RATE_LIMITED, retryAfterMs: limit.retryAfterMs, difficulty: 0, detail: '' },
+            frames: [encodeReject(REJECT.RATE_LIMITED, { retryAfterMs: limit.retryAfterMs })],
+            rate: encodeRate({
+              pressure: limit.pressure, budgetRemaining: 0,
+              refillPerSec: Math.floor(this.limiter.budget / (this.limiter.windowMs / 1000)),
+              blockUntilMs: now + limit.retryAfterMs, penaltyMs: limit.retryAfterMs,
+            }),
+            cost: 0,
+          },
         };
       }
     }
 
     // ── 3. scope / capability gate before any work ──────────────────────────
     if (identity) {
-      const need = this._requiredCaps(pathname, method);
+      const need = this._requiredCaps(pathname, method, intent);
       if ((identity.caps & need) !== need) {
-        return this._reject(REJECT.SCOPE_DENIED, 'insufficient scope');
+        return { ok: false, response: this._reject(REJECT.SCOPE_DENIED, 'insufficient scope') };
       }
       if (!isSubScope(identity.scope, pathname)) {
-        return this._reject(REJECT.SCOPE_DENIED, 'path outside token scope');
+        return { ok: false, response: this._reject(REJECT.SCOPE_DENIED, 'path outside token scope') };
       }
     }
 
     // ── 4. cost & deadline gate: refuse before spending ─────────────────────
     if (intent.deadlineMs !== undefined && intent.deadlineMs < 0) {
       this.metrics.deferred++;
-      return this._reject(REJECT.DEFERRED, 'expired deadline', 250);
+      return { ok: false, response: this._reject(REJECT.DEFERRED, 'expired deadline', 250) };
     }
-    const predicted = this._predictCost(pathname, method, intent, cost, h);
+    const predicted = this._predictCost(pathname, method, intent, cost);
     this.metrics.costPredicted++;
     if (intent.costCeiling && predicted > intent.costCeiling) {
-      return this._reject(REJECT.COST_REFUSED, `predicted ${predicted} > ceiling ${intent.costCeiling}`);
+      return { ok: false, response: this._reject(REJECT.COST_REFUSED, `predicted ${predicted} > ceiling ${intent.costCeiling}`) };
     }
     if (cost.tokenBudget && intent.maxShape && intent.maxShape > cost.tokenBudget) {
-      return this._reject(REJECT.COST_REFUSED, 'shape exceeds token budget');
+      return { ok: false, response: this._reject(REJECT.COST_REFUSED, 'shape exceeds token budget') };
     }
 
     const advertised = {
@@ -209,6 +292,26 @@ export class H4Server {
       refillPerSec: Math.floor((limit.effectiveBudget ?? this.limiter.budget) / (this.limiter.windowMs / 1000)),
       trusted: !!identity,
     };
+
+    return {
+      ok: true,
+      ctx: {
+        h, rawPath, pathname, query, method, intent, cost, identity,
+        subject, net, costClass, limit, predicted, advertised, earlyData,
+      },
+    };
+  }
+
+  /**
+   * Unary request handling. Reject and cache-hit paths never yield the event loop.
+   */
+  async handle(req, now = Date.now()) {
+    const adm = this._admit(req, now);
+    if (!adm.ok) return adm.response;
+    const {
+      h, rawPath, pathname, query, method, intent, cost, identity,
+      subject, costClass, limit, predicted, advertised,
+    } = adm.ctx;
 
     // ── 5. idempotency + tenant-isolated cache + coalescing ─────────────────
     const tenantTag = identity ? `id:${identity.tenant}` : `anon:${h['h4-tenant'] ?? ''}`;
@@ -235,7 +338,7 @@ export class H4Server {
     const cached = lookupMethod === 'GET' || intent.dedup ? this.cache.get(cacheKey, now) : null;
     if (cached) {
       payload = cached.value;
-      cacheState = cached.stale ? CACHE.HIT_STALE : CACHE.HIT;
+      cacheState = cached.stale ? CACHE.HIT_STALE : CACHE.MISS === -1 ? 0 : CACHE.HIT;
       this.metrics.cacheHits++;
       this.metrics.savedByCacheMs += cached.computeMs ?? 0;
     } else {
@@ -247,11 +350,29 @@ export class H4Server {
         const t0 = process.hrtime.bigint();
         let timer = null;
         try {
-          const workP = Promise.resolve(route({
+          let out = await Promise.resolve(route({
             path: pathname, rawPath, query, method, headers: h, body: req.body,
             intent, cost, identity, now, remainingMs: deadlineMs || 30_000,
           }));
-          const out = deadlineMs > 0
+          // If an async-generator route is invoked via unary handle(), collect chunks cleanly
+          if (isAsyncIterable(out) || isAsyncIterable(out?.stream)) {
+            const iter = isAsyncIterable(out) ? out : out.stream;
+            const chunks = [];
+            let count = 0;
+            for await (const ch of iter) {
+              chunks.push(Buffer.isBuffer(ch) ? ch : Buffer.from(typeof ch === 'string' ? ch : JSON.stringify(ch)));
+              count++;
+            }
+            out = {
+              status: out?.status ?? 200,
+              type: out?.type ?? 'application/octet-stream',
+              body: Buffer.concat(chunks),
+              tokens: count,
+              cost: out?.cost ?? Math.max(1, count),
+            };
+          }
+          const workP = Promise.resolve(out);
+          const raced = deadlineMs > 0
             ? await Promise.race([
                 workP,
                 new Promise((resolve) => {
@@ -260,17 +381,34 @@ export class H4Server {
                 }),
               ])
             : await workP;
-          if (out === DEADLINE_EXCEEDED) return { deferred: true, ms: deadlineMs };
+          if (raced === DEADLINE_EXCEEDED) return { deferred: true, ms: deadlineMs };
           const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-          return { out, ms, deferred: false };
+          return { out: raced, ms, deferred: false };
         } finally {
           if (timer) clearTimeout(timer);
         }
       };
 
-      let res;
+      // Note: race deadline around the whole route invocation (not after awaiting)
+      const runWithDeadline = async () => {
+        if (deadlineMs <= 0) return run();
+        let timer = null;
+        try {
+          const res = await Promise.race([
+            run(),
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve({ deferred: true, ms: deadlineMs }), deadlineMs);
+              timer.unref?.();
+            }),
+          ]);
+          return res;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+
       if (useDedup) {
-        res = await this.cache.coalesce(cacheKey, run);
+        const res = await this.cache.coalesce(cacheKey, runWithDeadline);
         if (res.value.deferred) {
           this.metrics.deferred++;
           return this._reject(REJECT.DEFERRED, `deadline ${deadlineMs}ms exceeded`, Math.min(deadlineMs * 2, 5000));
@@ -284,12 +422,16 @@ export class H4Server {
           cacheState = CACHE.MISS;
         }
         if (!res.coalesced && res.value.out !== undefined && (lookupMethod === 'GET' || intent.dedup)) {
-          const ttl = res.value.out.ttlMs ?? this.cache.defaultTtlMs;
-          this.cache.set(cacheKey, res.value.out, { ttlMs: ttl, computeMs: res.value.ms, memo: false, now });
+          const outStatus = res.value.out.status ?? 200;
+          const explicitTtl = res.value.out.ttlMs;
+          if (outStatus < 500 || (explicitTtl !== undefined && explicitTtl > 0)) {
+            const ttl = explicitTtl ?? this.cache.defaultTtlMs;
+            this.cache.set(cacheKey, res.value.out, { ttlMs: ttl, computeMs: res.value.ms, memo: false, now });
+          }
         }
         payload = res.value.out;
       } else {
-        const r = await run();
+        const r = await runWithDeadline();
         if (r.deferred) {
           this.metrics.deferred++;
           return this._reject(REJECT.DEFERRED, `deadline ${deadlineMs}ms exceeded`, Math.min(deadlineMs * 2, 5000));
@@ -300,7 +442,6 @@ export class H4Server {
       tokens = payload?.tokens ?? 0;
       memoReuse = Math.max(memoReuse, payload?.memoReuse ?? 0);
 
-      // Update learned per-route EMA from real execution cost
       if (payload?.cost !== undefined && Number.isFinite(payload.cost)) {
         const rk = `${lookupMethod} ${pathname}`;
         const prev = this.routeCosts.get(rk);
@@ -326,6 +467,162 @@ export class H4Server {
       limit, cost, advertised, method, path: pathname, subject, now,
       includeAccess: this.emitAccess || 'h4-trace' in h,
     });
+  }
+
+  /**
+   * First-class streaming (`MODE.SUBSCRIBE` / token streaming / SSE translation).
+   *
+   * Streams `HEADERS`, live `DATA` chunks via `onFrame`, aborts generation
+   * immediately when `signal` fires (`F.CANCEL` from client) or `deadlineMs`
+   * expires, refunds unspent budget on early cancel, and finishes with
+   * `COST` + `RATE` + `RESULT` trailers reporting exact partial cost & tokens.
+   */
+  async handleStream(req, { signal = null, onFrame = () => {}, now = Date.now() } = {}) {
+    const adm = this._admit(req, now);
+    if (!adm.ok) {
+      for (const f of adm.response.frames) onFrame(f);
+      return adm.response;
+    }
+    const {
+      h, rawPath, pathname, query, method, intent, cost, identity,
+      subject, net, costClass, limit, predicted, advertised,
+    } = adm.ctx;
+
+    const route = this._findRoute(method, pathname);
+    if (!route) {
+      const rej = this._reject(REJECT.MALFORMED, 'no route');
+      for (const f of rej.frames) onFrame(f);
+      return rej;
+    }
+
+    const ac = new AbortController();
+    let timer = null;
+    const onAbort = () => ac.abort(signal?.reason ?? 'cancelled');
+    if (signal) {
+      if (signal.aborted) ac.abort(signal.reason ?? 'cancelled');
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (intent.deadlineMs > 0) {
+      timer = setTimeout(() => ac.abort('deadline'), intent.deadlineMs);
+      timer.unref?.();
+    }
+
+    const started = process.hrtime.bigint();
+    const emittedFrames = [];
+    const emit = (f) => {
+      emittedFrames.push(f);
+      this.metrics.bytesOut += f.length;
+      onFrame(f);
+    };
+
+    let chunks = 0;
+    let costActual = 0;
+    let cancelled = false;
+
+    try {
+      const out = await route({
+        path: pathname, rawPath, query, method, headers: h, body: req.body,
+        intent, cost, identity, now, signal: ac.signal,
+        remainingMs: intent.deadlineMs || 30_000,
+      });
+
+      const iter = isAsyncIterable(out) ? out : (isAsyncIterable(out?.stream) ? out.stream : null);
+      if (!iter) {
+        // Unary route accessed via handleStream: emit full response frames
+        const res = this._buildSuccessResponse({
+          payload: out, cacheState: CACHE.COMPUTED, predicted, costClass,
+          tokens: out?.tokens ?? 0, memoReuse: 0,
+          wallMs: Number(process.hrtime.bigint() - started) / 1e6,
+          limit, cost, advertised, method, path: pathname, subject, now,
+          includeAccess: this.emitAccess || 'h4-trace' in h,
+        });
+        for (const f of res.frames) onFrame(f);
+        return res;
+      }
+
+      const status = out?.status ?? 200;
+      const contentType = out?.type ?? 'application/x-ndjson';
+      const costPerChunk = out?.costPerChunk ?? 1;
+
+      emit(encodeHeadersFrame([
+        [':status', String(status)],
+        ['content-type', contentType],
+        ['h4-stream', '1'],
+        ['h4-predicted', String(predicted)],
+      ]));
+
+      for await (const item of iter) {
+        if (ac.signal.aborted) {
+          cancelled = true;
+          break;
+        }
+        if (intent.costCeiling > 0 && costActual + costPerChunk > intent.costCeiling) {
+          cancelled = true;
+          ac.abort('cost-ceiling');
+          break;
+        }
+        const buf = Buffer.isBuffer(item)
+          ? item
+          : Buffer.from(typeof item === 'string' ? item : JSON.stringify(item) + '\n');
+        chunks++;
+        costActual += costPerChunk;
+        emit(encodeData(buf));
+        if (ac.signal.aborted) {
+          cancelled = true;
+          break;
+        }
+      }
+    } catch (err) {
+      if (ac.signal.aborted || err?.name === 'AbortError') {
+        cancelled = true;
+      } else {
+        throw err;
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+
+    if (cancelled) {
+      this.metrics.streamCancelled++;
+      const reservedWeight = predicted > costActual ? predicted - costActual : 0;
+      if (reservedWeight > 0) {
+        this.limiter.refund({ subject, net, units: Math.min(reservedWeight, 5) }, now);
+      }
+    }
+
+    const wallMs = Number(process.hrtime.bigint() - started) / 1e6;
+    const finalCost = Math.max(cancelled && chunks === 0 ? 0 : 1, Math.round(costActual));
+    emit(encodeCost({
+      predicted, costClass, effortBits: 0, budgetRemaining: limit.budgetRemaining,
+      value: cost.value, tokenBudget: chunks,
+    }));
+    emit(encodeRate({
+      pressure: limit.pressure, budgetRemaining: limit.budgetRemaining,
+      refillPerSec: Math.floor((limit.effectiveBudget ?? this.limiter.budget) / (this.limiter.windowMs / 1000)),
+      blockUntilMs: limit.blockUntilMs ?? 0, penaltyMs: 0,
+    }));
+    emit(encodeResult({
+      status: cancelled ? 206 : 200,
+      costActual: finalCost,
+      cache: CACHE.COMPUTED,
+      tokens: chunks,
+      memoReuse: 0,
+      wallMs: Math.round(wallMs),
+      costAsym: finalCost - predicted,
+      flags: cancelled ? 1 : 0,
+    }));
+
+    this.metrics.served++;
+    this.metrics.streamed++;
+
+    return {
+      result: { status: cancelled ? 206 : 200, costActual: finalCost, cache: CACHE.COMPUTED, tokens: chunks, wallMs, cancelled },
+      advertised,
+      frames: emittedFrames,
+      rate: limit,
+      cost: finalCost,
+    };
   }
 
   _buildSuccessResponse({
@@ -410,9 +707,9 @@ export class H4Server {
     };
   }
 
-  _subjectFromRequest(req, h) {
+  _subjectFromRequest(peerNorm, h) {
     const inst = h['h4-agent-instance'] || h['h4-agent'] || '';
-    const net = req.peer ?? 'anon';
+    const net = peerNorm ?? 'anon';
     return crypto.createHash('sha256').update(`${inst}|${net}`).digest('hex').slice(0, 16);
   }
 
@@ -423,13 +720,13 @@ export class H4Server {
     return CLASS.NORMAL;
   }
 
-  _requiredCaps(path, method) {
+  _requiredCaps(path, method, intent) {
+    if (method === 'SUB' || intent?.mode === MODE.SUBSCRIBE) return CAPS.SUBSCRIBE;
     if (method === 'GET' || method === 'HEAD') return CAPS.READ;
-    if (method === 'SUB') return CAPS.SUBSCRIBE | CAPS.READ;
     return CAPS.WRITE;
   }
 
-  _predictCost(path, method, intent, cost, h) {
+  _predictCost(path, method, intent, cost) {
     const learned = this.routeCosts.get(`${method} ${path}`);
     const base = learned !== undefined
       ? Math.max(1, Math.round(learned))
@@ -465,7 +762,6 @@ export class H4Server {
 
 const actualOrZero = (n) => (Number.isFinite(n) && n >= 0 ? Math.round(n) : 0);
 
-// Standalone CLI entrypoint (`npm run server` -> `node src/server.js`)
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const [{ createGateway }] = await Promise.all([import('./gateway.js')]);
   const port = Number(process.env.PORT ?? 8080);

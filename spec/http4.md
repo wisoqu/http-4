@@ -424,33 +424,61 @@ claims:       caps ‖ expiresAt ‖ scope ‖ delegable ‖ tenant ‖ nonce
 
 ---
 
-## 13. Приложение: карта репозитория
+## 13. Приложение: карта репозитория и обновления Draft 0.2
+
+### 13.1. Что добавлено в Draft 0.2 (`v0.2.0`)
+1. **Явное криптографическое доменное разделение (Domain Separation)**: все подписи Ed25519 и HMAC (`H4-CAP-ROOT-v1\0`, `H4-CAP-LINK-v1|`, `H4-RL-RECEIPT-v1|`, `H4-POE-CHAL-v1|`, `H4-PASS-v1|`, `H4-MH1|`/`H4-MH2|`) изолированы префиксами протокола, исключая межпротокольную путаницу ключей и транскриптов; добавлен O(1) отзыв грантов (`KeyRegistry.revokeGrant`).
+2. **Нативное C11 / Node-API v8 ядро (`native/`)**: единый C11 модуль без `#ifdef`-расхождений, проверенный под `AddressSanitizer + UndefinedBehaviorSanitizer` на 100 000 heap-bounded фазз-кейсах и 2 000 дифференциальных векторах `C11 ↔ JS` (ускорение `solvePoE` в **6.1×** до `2.99 M hashes/s`, `checkPoE` — `380 ns`).
+3. **Устранение асимметрии мобильных/GPU клиентов в PoE**:
+   - **Одноразовые крипто-пропуска (`h4-pass`, `src/privacy-pass.js`)**: позволяют легитимным клиентам проходить перегрузку (`EFFORT_REQUIRED`) за `~2 µs` с **0% расхода CPU/батареи** и защитой от повторного расходования.
+   - **Кэш-тяжёлый режим пазла (`poeMode: 'memhard'`)**: 4 KB data-dependent scratchpad с 64 зависимыми чтениями/записями снижает преимущество GPU/ASIC при константной стоимости проверки защитником (`~2.9 µs`).
+4. **Полноценный стриминг (`MODE.SUBSCRIBE`) и возврат бюджета при `F.CANCEL`**: потоковая передача `DATA`-кадров с пробросом `AbortSignal` ↔ `F.CANCEL` за `< 1 ms` останавливает генерацию на сервере и возвращает неизрасходованную часть зарезервированного бюджета.
+5. **Защита 0-RTT (`earlyData`) и транспорта**: неидемпотентные мутации в 0-RTT без `intent.idem` отклоняются с `REJECT.DEFERRED` (`425 Too Early`); транспорт защищён от ALPACA (`strictAlpn`), Slowloris (`handshakeTimeoutMs`) и Rapid-Reset (`maxConcurrentStreams`).
+6. **Профиль расширения HTTP/3 (RFC 9114 §7.2.8, `src/h3-compat.js`)**: маппинг семантических кадров H4 в безопасный диапазон расширений HTTP/3 `0x42..0x4d` (в обход зарезервированных кадров `0x00..0x0d`, GREASE `0x1f*N + 0x21` и WebTransport `0x41`).
+7. **SDK и универсальные адаптеры (`src/sdk.js`, `src/adapters.js`, `types/index.d.ts`)**: `createH4Fetch` с авто-апгрейдом по `Alt-Svc`, `AgentSession` для однострочной делегации суб-агентам, `toWebHandler` (Cloudflare Workers / Bun / Deno / Next.js) и `toNodeMiddleware` (Express / Connect / Fastify).
+
+### 13.2. Структура файлов
 
 ```
 http4/
-├── spec/http4.md              ← этот документ
+├── spec/http4.md              ← спецификация протокола
+├── SECURITY.md                ← формальная модель угроз и вынесенные внешние допущения
+├── native/
+│   ├── h4_core.h / h4_core.c  C11 движок (SHA-256, HMAC, PoE, 4KB MemHard, цепочки прав, сканер)
+│   ├── h4_napi.c              Node-API v8 биндинги
+│   └── test_san.c             ASan + UBSan стенд + 100 000 фазз-кейсов
 ├── src/
-│   ├── varint.js              кодирование целых (QUIC-совместимое, RFC 9000 §16)
-│   ├── headers.js             статическая таблица + префиксный словарь + интернирование
+│   ├── native.js              загрузчик C11 аддона с прозрачным pure-JS fallback
+│   ├── varint.js              QUIC-varint (RFC 9000 §16, 62 бита + zigzag)
+│   ├── headers.js             статический словарь + защита от CRLF/NUL/smuggling
 │   ├── frames.js              14 типов кадров (`HELLO`, `INTENT`, `COST`, `CAP`, `RESULT`, …)
-│   ├── identity.js            capability-токены, подписанный maxSubs, офлайн-делегация
-│   ├── limits.js              три ступени лимитов, квитанции, одноразовый PoE
-│   ├── cache.js               tenant-изолированный LRU + coalescing + SWR
-│   ├── server.js              порядок проверок, `deadline_ms`, `idem`, экономика ответа
-│   ├── client.js              честный учёт, обучение по `cost_asym`, самоблокировка
-│   ├── wire.js                QUIC-нумерованные потоки + `F.HELLO` поверх TLS 1.3 (`ALPN h4`)
-│   ├── gateway.js             edge-гейтвей HTTP/1.1 и HTTP/2 ↔ HTTP/4
+│   ├── identity.js            capability-токены с доменным разделением и `revokeGrant`
+│   ├── limits.js              кооперативные квитанции, `h4-pass`, `sha256` и `memhard` PoE
+│   ├── privacy-pass.js        одноразовые пропуска перегрузки (`PassIssuer`)
+│   ├── h3-compat.js           GREASE-безопасный профиль расширения HTTP/3 (RFC 9114)
+│   ├── cache.js               tenant-изолированный LRU + singleflight coalescing + SWR
+│   ├── server.js              порядок проверок, 0-RTT защита, `handle` и `handleStream`
+│   ├── client.js              бюджетный бухгалтер, `maxEffortBits`, онлайн-обучение `cost_asym`
+│   ├── wire.js                мультиплексированный TLS 1.3 транспорт (`ALPN h4`, `F.CANCEL`)
+│   ├── gateway.js             HTTP/1.1 & HTTP/2 ↔ HTTP/4 гейтвей + SSE трансляция
+│   ├── sdk.js                 Web `fetch` клиент (`createH4Fetch`) + `AgentSession`
+│   ├── adapters.js            `toWebHandler`, `toNodeMiddleware`, `wrapFetchHandler`
 │   └── index.js
-├── test/run.js                62 инварианта (спека §N ↔ тест)
-├── bench/bench.js             размеры, кодек, примитивы, стоимость запроса, экономика PoE
-└── bench/attack-sim.js        сравнение collateral damage
+├── types/index.d.ts           полные TypeScript декларации
+├── examples/agent-mesh.js     end-to-end пример мультиагентной сети со стримингом
+├── test/
+│   ├── run.js                 62 базовых инварианта спецификации
+│   └── security-audit.js      15 red-team & differential C11↔JS fuzz тестов
+└── bench/                     `bench.js` и `attack-sim.js`
 ```
 
-Запуск:
+Запуск проверок:
 
 ```bash
-node test/run.js        # 62 passed, 0 failed
-node bench/bench.js     # измерения, на которые ссылается спека
+npm test                # 62 + 15 инвариантов (C11 N-API)
+npm run test:purejs     # 62 + 15 инвариантов (pure-JS fallback)
+npm run test:san        # C11 AddressSanitizer + UndefinedBehaviorSanitizer
+npm run bench           # измерения на текущем железе
 node bench/attack-sim.js 20000
 ```
 

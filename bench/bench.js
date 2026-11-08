@@ -8,10 +8,11 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import { encodeHeaders, decodeHeaders } from '../src/headers.js';
 import * as fr from '../src/frames.js';
-import { Limiter, signReceipt, encodeReceipt, poeChallenge, solvePoE, checkPoE } from '../src/limits.js';
+import { Limiter, signReceipt, encodeReceipt, poeChallenge, solvePoE, checkPoE, checkMemHard } from '../src/limits.js';
 import { H4Server } from '../src/server.js';
 import { H4Client } from '../src/client.js';
 import { mintRoot, attenuate, verify, KeyRegistry, CAPS } from '../src/identity.js';
+import { isNativeLoaded } from '../src/native.js';
 
 const quick = process.argv[2] === 'quick';
 const fmt = (n, d = 0) => n.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -28,7 +29,7 @@ function time(fn, iters) {
 }
 
 console.log(`\x1b[1mHTTP/4 reference benchmark\x1b[0m`);
-console.log(`node ${process.version} · ${os.cpus()[0].model.trim()} ×${os.cpus().length} · ${fmt(os.totalmem() / 1e6)} MB`);
+console.log(`node ${process.version} · ${os.cpus()[0].model.trim()} ×${os.cpus().length} · ${fmt(os.totalmem() / 1e6)} MB · C11 N-API=${isNativeLoaded}`);
 
 // ─────────────────────────────────────────────────────────────────────────────
 rule('1. Request size on the wire (what the network actually carries)');
@@ -138,14 +139,22 @@ let b8;
 
   // ───────────────────────────────────────────────────────────────────────────
   rule('5. Proof-of-effort economics (attacker pays, defender does not)');
-  const hr0 = time(() => crypto.createHash('sha256').update('x').digest(), 500000);
-  console.log(`SHA-256 rate (1 core) ${fmt(hr0.opsPerSec / 1e6, 2)} M hashes/s  → 1 core does`);
+  const poeChal = Buffer.alloc(32, 7);
+  const tSolve0 = process.hrtime.bigint();
+  const benchIters = 200_000;
+  solvePoE(poeChal, 30, benchIters); // run exact benchIters hashes in C11 / JS
+  const solveSec = Number(process.hrtime.bigint() - tSolve0) / 1e9;
+  const hashRate = benchIters / solveSec;
+  const defSha = time(() => checkPoE(poeChal, 42, 16), 200000);
+  const defMh = time(() => checkMemHard(poeChal, 42, 12), 40000);
+  console.log(`PoE solver rate (1 core)  ${fmt(hashRate / 1e6, 2)} M hashes/s  (${isNativeLoaded ? 'C11 N-API' : 'pure JS'}) → 1 core does`);
   for (const bits of [12, 16, 20, 24]) {
     const expected = 2 ** bits;
-    const secPerCore = expected / hr0.opsPerSec;
-    console.log(`  difficulty ${String(bits).padStart(2)} bits: ~${fmt(expected, 0)} hashes = ${secPerCore < 60 ? secPerCore.toFixed(2) + ' s' : (secPerCore / 60).toFixed(1) + ' min'} of one core, per request, attacker-side`);
+    const secPerCore = expected / hashRate;
+    console.log(`  difficulty ${String(bits).padStart(2)} bits: ~${fmt(expected, 0)} hashes = ${secPerCore < 60 ? secPerCore.toFixed(3) + ' s' : (secPerCore / 60).toFixed(1) + ' min'} of one core, per request, attacker-side`);
   }
-  console.log('  defender per request: constant (~1 SHA-256 verify ≈ ' + bus(hr0.perOp) + ') regardless of difficulty.');
+  console.log(`  defender verify (SHA-256 PoE):  constant ≈ ${bus(defSha.perOp)} (${fmt(defSha.opsPerSec / 1e6, 2)} M verifies/s)`);
+  console.log(`  defender verify (4KB MemHard):  constant ≈ ${bus(defMh.perOp)} (${fmt(defMh.opsPerSec / 1e3, 0)} k verifies/s)`);
 
   // ───────────────────────────────────────────────────────────────────────────
   if (!quick) {

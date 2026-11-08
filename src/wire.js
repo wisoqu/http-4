@@ -1,47 +1,43 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // H4 wire adapter — QUIC-aligned reference carrier over TLS 1.3.
 //
-// In production H4 rides QUIC v1 (RFC 9000):
-//   * ALPN token: `h4`
-//   * Control stream (QUIC unidirectional stream 2 / 3): carries `F.HELLO` (0x0d)
-//   * Request streams (QUIC client-initiated bidi streams 0, 4, 8, 12, …):
-//     carry H4 request/response flights directly.
-//
-// Because Node.js does not expose an unflagged UDP QUIC socket in standard
-// sandboxes, this carrier multiplexes QUIC-numbered streams over TLS 1.3 using
-// QUIC varint framing:
-//
-//   envelope : streamId(varint) | length(varint) | H4 frames…
-//
-// Every byte inside `H4 frames…` — including `F.HELLO` on the control stream —
-// is a pure H4 frame from `src/frames.js`. Moving to a native QUIC transport
-// removes only the 2-varint stream envelope.
+// Hardened with:
+//   * handshakeTimeoutMs (anti-Slowloris pre-HELLO stall guard)
+//   * idleTimeoutMs      (socket idle timeout)
+//   * maxConcurrentStreams (anti-Rapid-Reset / stream-flood cap)
+//   * IPv4-mapped IPv6 peer normalization
+//   * Live bidirectional streaming (`MODE.SUBSCRIBE` + mid-stream `F.CANCEL`)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import tls from 'node:tls';
-import { Writer, readVarint, varintSize, writeVarint } from './varint.js';
+import { readVarint, varintSize, writeVarint } from './varint.js';
 import { Limiter } from './limits.js';
+import { normalizePeerIp } from './server.js';
 import {
-  iterFrames, F, REJECT,
-  decodeIntent, decodeCost, decodeCap,
-  encodeHello, decodeHello, encodeReject, encodePing, decodePing,
+  iterFrames, F, REJECT, MODE,
+  decodeIntent, decodeCost, decodeCap, decodeCancel, decodeHeadersFrame, decodeResult, decodeReject,
+  encodeHello, decodeHello, encodeReject, encodeCancel, decodePing,
 } from './frames.js';
 import { decodeHeaders, TABLE_VERSION } from './headers.js';
 
 export const PROTO = 'h4/1';
 export const ALPN_PROTOCOLS = ['h4', 'h4/1'];
-export const CLIENT_CONTROL_STREAM = 2; // RFC 9000 §2.1: client-initiated uni stream 0b10
-export const SERVER_CONTROL_STREAM = 3; // RFC 9000 §2.1: server-initiated uni stream 0b11
+export const CLIENT_CONTROL_STREAM = 2;
+export const SERVER_CONTROL_STREAM = 3;
 
-/** Streaming QUIC-varint length-prefixed message parser. Handles split & coalesced TLS records. */
+/** Streaming QUIC-varint length-prefixed message parser. */
 export class MessageParser {
-  constructor(onMessage, { maxFrameBytes = 16 * 1024 * 1024 } = {}) {
+  constructor(onMessage, { maxFrameBytes = 16 * 1024 * 1024, maxBufferBytes = 32 * 1024 * 1024 } = {}) {
     this.buf = Buffer.alloc(0);
     this.onMessage = onMessage;
     this.maxFrameBytes = maxFrameBytes;
+    this.maxBufferBytes = maxBufferBytes;
   }
 
   push(chunk) {
+    if (this.buf.length + chunk.length > this.maxBufferBytes) {
+      throw new RangeError('receive buffer exceeded maxBufferBytes');
+    }
     this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
     while (this.buf.length > 0) {
       let s, l;
@@ -49,7 +45,6 @@ export class MessageParser {
         s = readVarint(this.buf, 0);
         l = readVarint(this.buf, s.size);
       } catch {
-        // Need more bytes to finish reading varint header (at most 16 bytes for 2 varints)
         if (this.buf.length < 16) return;
         throw new RangeError('malformed envelope varint');
       }
@@ -75,18 +70,60 @@ export function packMessage(streamId, frames) {
   return out;
 }
 
-/** Build a TLS 1.3 server carrying H4 with ALPN `h4`. `handler` is an H4Server instance. */
-export function createServer({ handler, tlsOptions = {}, metadata = {}, clusterSecret = null, maxFrameBytes = 16 * 1024 * 1024 }) {
+function hasTerminalFrame(buf) {
+  for (const f of iterFrames(buf)) {
+    if (f.type === F.RESULT || f.type === F.REJECT) return true;
+  }
+  return false;
+}
+
+/** Build a TLS 1.3 server carrying H4 with ALPN `h4`. */
+export function createServer({
+  handler,
+  tlsOptions = {},
+  metadata = {},
+  clusterSecret = null,
+  maxFrameBytes = 16 * 1024 * 1024,
+  handshakeTimeoutMs = 5_000,
+  idleTimeoutMs = 60_000,
+  maxConcurrentStreams = 256,
+  strictAlpn = true,
+}) {
   const server = tls.createServer({
     ALPNProtocols: ALPN_PROTOCOLS,
     minVersion: 'TLSv1.3',
     ...tlsOptions,
   }, (socket) => {
-    const peer = socket.remoteAddress ?? 'unknown';
+    // ALPACA cross-protocol defense: require negotiated ALPN `h4` or `h4/1`
+    if (strictAlpn && socket.alpnProtocol !== 'h4' && socket.alpnProtocol !== 'h4/1') {
+      socket.destroy();
+      return;
+    }
+    socket.setNoDelay(true);
+    const peer = normalizePeerIp(socket.remoteAddress);
     const sessionKey = clusterSecret
       ? Limiter.deriveSessionKey(clusterSecret, peer)
       : Limiter.sessionKey();
     let ready = false;
+    const activeStreams = new Map(); // streamId -> AbortController
+
+    if (idleTimeoutMs > 0) {
+      socket.setTimeout(idleTimeoutMs, () => socket.destroy());
+    }
+
+    let hsTimer = null;
+    if (handshakeTimeoutMs > 0) {
+      hsTimer = setTimeout(() => {
+        if (!ready && !socket.destroyed) socket.destroy();
+      }, handshakeTimeoutMs);
+      hsTimer.unref?.();
+    }
+
+    const abortAllStreams = () => {
+      if (hsTimer) { clearTimeout(hsTimer); hsTimer = null; }
+      for (const [, ac] of activeStreams) ac.abort('connection-closed');
+      activeStreams.clear();
+    };
 
     const parser = new MessageParser((streamId, payload) => {
       if (streamId === CLIENT_CONTROL_STREAM) {
@@ -111,6 +148,7 @@ export function createServer({ handler, tlsOptions = {}, metadata = {}, clusterS
             agent: hello.agent || 'unknown',
           });
           ready = true;
+          if (hsTimer) { clearTimeout(hsTimer); hsTimer = null; }
           if (!socket.destroyed) socket.write(packMessage(SERVER_CONTROL_STREAM, reply));
         } catch {
           socket.destroy();
@@ -118,27 +156,73 @@ export function createServer({ handler, tlsOptions = {}, metadata = {}, clusterS
         return;
       }
 
-      // Request streams (QUIC client-initiated bidirectional streams: streamId % 4 === 0)
       if (!ready || (streamId & 0x3) !== 0) {
         socket.destroy();
         return;
       }
 
-      Promise.resolve().then(async () => {
-        let req;
+      // Check if this is a mid-stream F.CANCEL for an in-flight stream
+      if (activeStreams.has(streamId)) {
         try {
-          req = decodeRequest(payload, peer);
-        } catch (err) {
-          const rej = encodeReject(REJECT.MALFORMED, { detail: err.message });
-          if (!socket.destroyed) socket.write(packMessage(streamId, rej));
+          for (const f of iterFrames(payload)) {
+            if (f.type === F.CANCEL) {
+              decodeCancel(f.payload);
+              activeStreams.get(streamId)?.abort('client-cancel');
+            }
+          }
+        } catch {
+          socket.destroy();
+        }
+        return;
+      }
+
+      // Enforce per-connection maxConcurrentStreams (anti-Rapid-Reset DoS)
+      if (activeStreams.size >= maxConcurrentStreams) {
+        if (activeStreams.size >= maxConcurrentStreams * 2) {
+          socket.destroy();
           return;
         }
-        req.sessionKey = sessionKey;
-        const res = await handler.handle(req);
-        if (!socket.destroyed) {
-          socket.write(packMessage(streamId, Buffer.concat(res.frames)));
+        const rej = encodeReject(REJECT.RATE_LIMITED, { retryAfterMs: 100, detail: 'max-concurrent-streams' });
+        if (!socket.destroyed) socket.write(packMessage(streamId, rej));
+        return;
+      }
+
+      const ac = new AbortController();
+      activeStreams.set(streamId, ac);
+
+      Promise.resolve().then(async () => {
+        try {
+          let req;
+          try {
+            req = decodeRequest(payload, peer);
+          } catch (err) {
+            const rej = encodeReject(REJECT.MALFORMED, { detail: err.message });
+            if (!socket.destroyed) socket.write(packMessage(streamId, rej));
+            return;
+          }
+          req.sessionKey = sessionKey;
+
+          const method = (req.headers.find(([k]) => k === ':method')?.[1] ?? 'GET').toUpperCase();
+          if (req.intent?.mode === MODE.SUBSCRIBE || method === 'SUB') {
+            await handler.handleStream(req, {
+              signal: ac.signal,
+              onFrame: (frameBuf) => {
+                if (!socket.destroyed) {
+                  socket.write(packMessage(streamId, frameBuf));
+                }
+              },
+            });
+          } else {
+            const res = await handler.handle(req);
+            if (!socket.destroyed) {
+              socket.write(packMessage(streamId, Buffer.concat(res.frames)));
+            }
+          }
+        } finally {
+          activeStreams.delete(streamId);
         }
       }).catch(() => {
+        activeStreams.delete(streamId);
         if (!socket.destroyed) socket.destroy();
       });
     }, { maxFrameBytes });
@@ -150,18 +234,23 @@ export function createServer({ handler, tlsOptions = {}, metadata = {}, clusterS
         socket.destroy();
       }
     });
-    socket.on('error', () => socket.destroy());
+    socket.on('close', abortAllStreams);
+    socket.on('error', () => {
+      abortAllStreams();
+      socket.destroy();
+    });
   });
   return server;
 }
 
-/** Client: connect over TLS 1.3 + ALPN `h4`, exchange `F.HELLO`, multiplex QUIC-numbered streams. */
+/** Client: connect over TLS 1.3 + ALPN `h4`, exchange `F.HELLO`, multiplex unary & streaming calls. */
 export async function connect({
   host = '127.0.0.1',
   port,
   tlsOptions = {},
-  agent = 'h4-ref-client/0.1',
+  agent = 'h4-ref-client/0.2',
   maxFrameBytes = 16 * 1024 * 1024,
+  connectTimeoutMs = 5_000,
 } = {}) {
   const socket = tls.connect({
     host,
@@ -170,9 +259,10 @@ export async function connect({
     servername: 'localhost',
     ...tlsOptions,
   });
+  socket.setNoDelay(true);
 
   const pending = new Map();
-  let bidiSeq = 0; // QUIC client-initiated bidi streams: 0, 4, 8, 12, …
+  let bidiSeq = 0;
   let handshake = null;
   let lastError = null;
   let handshakeResolve, handshakeReject;
@@ -188,7 +278,6 @@ export async function connect({
     pending.clear();
   };
 
-  // Single persistent stream parser for the lifetime of the connection!
   const parser = new MessageParser((streamId, payload) => {
     if (streamId === SERVER_CONTROL_STREAM && !handshake) {
       try {
@@ -213,10 +302,45 @@ export async function connect({
       }
       return;
     }
+
     const entry = pending.get(streamId);
-    if (entry) {
+    if (!entry) return;
+
+    if (entry.streaming) {
+      entry.chunks.push(payload);
+      try {
+        for (const f of iterFrames(payload)) {
+          if (f.type === F.HEADERS && entry.onHeaders) {
+            entry.onHeaders(decodeHeadersFrame(f.payload));
+          } else if (f.type === F.DATA && entry.onData) {
+            entry.onData(Buffer.from(f.payload));
+          } else if (f.type === F.RESULT || f.type === F.REJECT) {
+            pending.delete(streamId);
+            entry.cleanup?.();
+            entry.resolve(Buffer.concat(entry.chunks));
+            return;
+          }
+        }
+      } catch (e) {
+        pending.delete(streamId);
+        entry.cleanup?.();
+        entry.reject(e);
+      }
+      return;
+    }
+
+    // Unary stream (accumulate if multi-message until RESULT/REJECT)
+    if (entry.chunks) {
+      entry.chunks.push(payload);
+      if (hasTerminalFrame(payload)) {
+        pending.delete(streamId);
+        entry.resolve(Buffer.concat(entry.chunks));
+      }
+    } else if (hasTerminalFrame(payload)) {
       pending.delete(streamId);
       entry.resolve(payload);
+    } else {
+      entry.chunks = [payload];
     }
   }, { maxFrameBytes });
 
@@ -231,7 +355,16 @@ export async function connect({
   socket.on('error', (err) => failAll(err));
   socket.on('close', () => failAll(lastError ?? new Error('H4 connection closed')));
 
+  let connectTimer = null;
   await new Promise((res, rej) => {
+    if (connectTimeoutMs > 0) {
+      connectTimer = setTimeout(() => {
+        const err = new Error('H4 connect timeout');
+        socket.destroy(err);
+        rej(err);
+      }, connectTimeoutMs);
+      connectTimer.unref?.();
+    }
     socket.once('secureConnect', res);
     socket.once('error', rej);
   });
@@ -239,14 +372,13 @@ export async function connect({
   const clientHello = encodeHello({ proto: PROTO, tableVersion: TABLE_VERSION, agent });
   socket.write(packMessage(CLIENT_CONTROL_STREAM, clientHello));
   const hs = await handshakeP;
+  if (connectTimer) clearTimeout(connectTimer);
 
   return {
     handshake: hs,
     alpnProtocol: socket.alpnProtocol,
     sessionKey: Buffer.from(hs.sessionKey, 'base64url'),
-    /**
-     * Send one request on a fresh client-initiated bidirectional stream (0, 4, 8, …).
-     */
+
     request(frames, { virtual = null } = {}) {
       if (virtual && virtual.send === false) {
         return Promise.resolve({ virtual, payload: null });
@@ -257,12 +389,66 @@ export async function connect({
       const streamId = (bidiSeq++) * 4;
       return new Promise((resolve, reject) => {
         pending.set(streamId, {
+          streaming: false,
+          chunks: null,
           resolve: (payload) => resolve({ virtual, payload, streamId }),
           reject,
         });
         socket.write(packMessage(streamId, frames));
       });
     },
+
+    /**
+     * Open a live streaming subscription (`MODE.SUBSCRIBE`).
+     * Calls `onData(chunk)` as `F.DATA` frames arrive, sends `F.CANCEL` if
+     * `signal` aborts, and resolves with `{ payload, streamId, result, reject }`.
+     */
+    subscribe(frames, { onData = null, onHeaders = null, signal = null } = {}) {
+      if (socket.destroyed) {
+        return Promise.reject(lastError ?? new Error('H4 connection closed'));
+      }
+      const streamId = (bidiSeq++) * 4;
+      return new Promise((resolve, reject) => {
+        const sendCancel = () => {
+          if (!socket.destroyed && pending.has(streamId)) {
+            socket.write(packMessage(streamId, encodeCancel({ code: 1 })));
+          }
+        };
+        const cleanup = () => {
+          if (signal) signal.removeEventListener('abort', sendCancel);
+        };
+        if (signal) {
+          if (signal.aborted) {
+            return reject(new Error('Aborted before subscribe'));
+          }
+          signal.addEventListener('abort', sendCancel, { once: true });
+        }
+        pending.set(streamId, {
+          streaming: true,
+          chunks: [],
+          onData,
+          onHeaders,
+          cleanup,
+          resolve: (payload) => {
+            let resObj = null, rejObj = null;
+            for (const f of iterFrames(payload)) {
+              if (f.type === F.RESULT) resObj = decodeResult(f.payload);
+              else if (f.type === F.REJECT) rejObj = decodeReject(f.payload);
+            }
+            resolve({ payload, streamId, result: resObj, reject: rejObj });
+          },
+          reject,
+        });
+        socket.write(packMessage(streamId, frames));
+      });
+    },
+
+    cancel(streamId, code = 0) {
+      if (!socket.destroyed) {
+        socket.write(packMessage(streamId, encodeCancel({ code })));
+      }
+    },
+
     close() { socket.end(); },
     get streamSeq() { return bidiSeq; },
     get pendingCount() { return pending.size; },
@@ -277,6 +463,7 @@ export function decodeRequest(framesBuf, peer) {
     cap: undefined,
     rate: null,
     effortNonce: undefined,
+    pass: undefined,
     body: null,
     peer,
     byteLength: framesBuf.length,
@@ -321,6 +508,8 @@ export function decodeRequest(framesBuf, peer) {
       const n = Number(v);
       if (!Number.isSafeInteger(n) || n < 0) throw new RangeError('invalid h4-effort nonce');
       req.effortNonce = n;
+    } else if (k === 'h4-pass' && v !== '') {
+      req.pass = v;
     }
   }
 
