@@ -9,10 +9,15 @@ import os from 'node:os';
 import { encodeHeaders, decodeHeaders } from '../src/headers.js';
 import * as fr from '../src/frames.js';
 import { Limiter, signReceipt, encodeReceipt, poeChallenge, solvePoE, checkPoE, checkMemHard } from '../src/limits.js';
+import { PassIssuer } from '../src/privacy-pass.js';
 import { H4Server } from '../src/server.js';
 import { H4Client } from '../src/client.js';
-import { mintRoot, attenuate, verify, KeyRegistry, CAPS } from '../src/identity.js';
-import { isNativeLoaded } from '../src/native.js';
+import { mintRoot, attenuate, verify, KeyRegistry, CAPS, hmacLinkJs } from '../src/identity.js';
+import { isNativeLoaded, nativeBinding } from '../src/native.js';
+import { createServer as createWireServer, connect as wireConnect } from '../src/wire.js';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const quick = process.argv[2] === 'quick';
 const fmt = (n, d = 0) => n.toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -62,8 +67,9 @@ for (const [name, hdrs] of Object.entries(cases)) {
   const ratio = (h11 / h4);
   console.log(`${name.padEnd(24)} ${String(h4).padStart(6)}   ${String(h11).padStart(11)}   \x1b[32m${fmt(ratio, 2)}× smaller\x1b[0m`);
 }
-console.log('\nnote: HTTP/2/3 with HPACK/QPACK typically lands 30–60 B on a cold table and');
-console.log('      needs per-connection state; H4 is state-free and < 25 B for these cases.');
+console.log('\nnote: HTTP/2/3 with HPACK/QPACK typically lands 30–60 B on a cold dynamic table');
+console.log('      and tracks per-connection compression state; H4 lands 12–55 B here with');
+console.log('      zero dynamic table state (static table negotiated via HELLO.tableVersion).');
 
 // ─────────────────────────────────────────────────────────────────────────────
 rule('2. Codec cost (per op, single core)');
@@ -94,8 +100,30 @@ console.log(`limit check enforced  ${bus(b5.perOp).padStart(9)}   ${fmt(b5.opsPe
 
 const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
 const reg = new KeyRegistry().add(1, publicKey);
-const root = mintRoot({ keyId: 1, privateKey, caps: CAPS.READ | CAPS.WRITE, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
-const chain = attenuate(attenuate(root, { caps: CAPS.READ, expiresAt: Math.floor(Date.now() / 1000) + 1800 }), { caps: CAPS.READ, expiresAt: Math.floor(Date.now() / 1000) + 900 });
+const root = mintRoot({ keyId: 1, privateKey, caps: CAPS.READ | CAPS.WRITE | CAPS.DELEGATE, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+const chain = attenuate(attenuate(root, { caps: CAPS.READ | CAPS.DELEGATE, expiresAt: Math.floor(Date.now() / 1000) + 1800 }), { caps: CAPS.READ, expiresAt: Math.floor(Date.now() / 1000) + 900 });
+
+const hmacKey = crypto.randomBytes(16);
+const hmacDom = Buffer.from('H4-CAP-LINK-v1|');
+const hmacMsg = crypto.randomBytes(24);
+const bHmac = time(() => (
+  nativeBinding
+    ? nativeBinding.hmacSha256(hmacKey, hmacDom, hmacMsg, 16)
+    : hmacLinkJs(hmacKey, hmacMsg)
+), 200000);
+console.log(`raw HMAC-SHA256-128   ${bus(bHmac.perOp).padStart(9)}   ${fmt(bHmac.opsPerSec / 1e6, 2)} M ops/s   (${isNativeLoaded ? 'C11 N-API' : 'pure JS'})`);
+
+const exp1 = Math.floor(Date.now() / 1000) + 1800;
+const bAtten = time((i) => attenuate(root, { caps: CAPS.READ, scope: '/v1', expiresAt: exp1, subs: i & 0xffff }), 100000);
+console.log(`cap attenuate (1 hop) ${bus(bAtten.perOp).padStart(9)}   ${fmt(bAtten.opsPerSec / 1e6, 2)} M ops/s   (parse + claims + HMAC)`);
+
+const passPoolSize = 40000;
+const passIssuer = new PassIssuer({ maxRedeemed: passPoolSize + 4096 });
+const preMintedPasses = Array.from({ length: passPoolSize + 2000 }, () => passIssuer.mint());
+let passIdx = 0;
+const bPass = time(() => passIssuer.redeem(preMintedPasses[passIdx++]), passPoolSize);
+console.log(`h4-pass redeem (full) ${bus(bPass.perOp).padStart(9)}   ${fmt(bPass.opsPerSec / 1e6, 2)} M ops/s   (decode + HMAC192 + replay map)`);
+
 const cache = new Map();
 const b6 = time(() => verify(chain, reg, { cache }), 100000);
 console.log(`cap verify (2 hops)   ${bus(b6.perOp).padStart(9)}   ${fmt(b6.opsPerSec / 1e6, 2)} M ops/s   (root sig cached)`);
@@ -136,6 +164,59 @@ let b8;
   const b9 = time(() => { rs.handle(mkReq('/cheap')); }, 100000);
   console.log(`reject (rate/effort)  ${bus(b9.perOp).padStart(9)}   ${fmt(b9.opsPerSec / 1e6, 2)} M ops/s`);
   console.log(`→ a rejection costs \x1b[32m${fmt(b8.perOp / b9.perOp, 1)}×\x1b[0m less than a served request.`);
+
+  // Measure real F.CANCEL propagation latency over loopback TLS 1.3
+  const certDir = fs.mkdtempSync(path.join(os.tmpdir(), 'h4-bench-tls-'));
+  try {
+    const kp = path.join(certDir, 'k.pem'), cp = path.join(certDir, 'c.pem');
+    execFileSync('openssl', [
+      'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+      '-keyout', kp, '-out', cp, '-days', '1', '-nodes', '-subj', '/CN=localhost',
+    ], { stdio: 'ignore' });
+    const tlsKey = fs.readFileSync(kp), tlsCert = fs.readFileSync(cp);
+    let serverAbortAt = 0n;
+    let readyResolve, abortResolve;
+    const cancelSrvH4 = new H4Server({
+      routes: {
+        'SUB /stream': async function* ({ signal }) {
+          signal.addEventListener('abort', () => {
+            serverAbortAt = process.hrtime.bigint();
+            abortResolve?.();
+          }, { once: true });
+          yield 'chunk-0';
+          readyResolve?.();
+          await new Promise((r) => { signal.addEventListener('abort', r, { once: true }); });
+        },
+      },
+    });
+    const wireSrv = createWireServer({ handler: cancelSrvH4, tlsOptions: { key: tlsKey, cert: tlsCert } });
+    await new Promise((r) => wireSrv.listen(0, '127.0.0.1', r));
+    const conn = await wireConnect({
+      host: '127.0.0.1', port: wireSrv.address().port,
+      tlsOptions: { ca: tlsCert, rejectUnauthorized: true },
+    });
+    const cli = new H4Client({ sessionKey: conn.sessionKey });
+    const samplesUs = [];
+    for (let k = 0; k < 25; k++) {
+      const readyP = new Promise((r) => { readyResolve = r; });
+      const abortP = new Promise((r) => { abortResolve = r; });
+      const ac = new AbortController();
+      const subP = conn.subscribe(cli.build({ path: '/stream', method: 'SUB' }).frames, { signal: ac.signal });
+      await readyP;
+      const tCancel0 = process.hrtime.bigint();
+      ac.abort('bench-cancel');
+      await abortP;
+      await subP;
+      samplesUs.push(Number(serverAbortAt - tCancel0) / 1000);
+    }
+    samplesUs.sort((a, b) => a - b);
+    const medianUs = samplesUs[Math.floor(samplesUs.length / 2)];
+    console.log(`F.CANCEL halt (TLS)   ${bus(medianUs * 1000).padStart(9)}   median client abort() → server signal abort (loopback TLS 1.3)`);
+    conn.close();
+    wireSrv.close();
+  } finally {
+    fs.rmSync(certDir, { recursive: true, force: true });
+  }
 
   // ───────────────────────────────────────────────────────────────────────────
   rule('5. Proof-of-effort economics (attacker pays, defender does not)');

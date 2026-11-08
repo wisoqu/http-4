@@ -380,7 +380,8 @@ export class AgentSession {
   }
 
   /**
-   * Delegate a narrower capability offline in ~2 µs (zero network calls to issuer).
+   * Delegate a narrower capability offline (~2 µs raw HMAC, ~7 µs full token
+   * parse + claims encode; zero network calls to issuer).
    */
   delegate({
     caps = CAPS.READ,

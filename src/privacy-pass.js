@@ -1,10 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// H4 Single-Use Overload Bypass Passes (`h4-pass` header)
+// H4 Single-Use Overload Passes (`h4-pass` header)
 //
-// Solves the mobile/battery asymmetry of Proof-of-Effort: legitimate clients can
-// acquire a wallet of compact, domain-separated, single-use passes during calm
-// periods or authentication, and redeem 1 pass in ~2 µs during server overload
-// without burning any client CPU cycles on SHA-256 / MemHard puzzles.
+// IMPORTANT: Despite the historical filename `privacy-pass.js`, this module
+// does NOT implement IETF Privacy Pass (RFC 9576–9578) blind signatures or
+// VOPRF. Tokens are single-use HMAC-SHA256-192 passes issued and verified by
+// the same party: `passId` is visible at both issuance and redemption, so
+// tokens are linkable by the issuer and provide no cryptographic unlinkability.
+//
+// Purpose: let battery-constrained or pre-authenticated clients acquire a
+// wallet of single-use overload passes during calm periods and redeem 1 pass
+// (~6 µs full verification, ~2 µs raw HMAC) during server overload without
+// burning client CPU cycles on SHA-256 / MemHard puzzles.
 //
 // Wire format (raw bytes, base64url-encoded in `h4-pass` header):
 //   ver(1B = 1) ‖ keyId(varint) ‖ passId(16B) ‖ expiresAtSec(varint) ‖

@@ -2,7 +2,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // `http4` Zero-Code CLI:
 //   npx http4 doctor
-//   npx http4 proxy --upstream http://127.0.0.1:8000 --port 8080 [--budget 200] [--ttl 5000]
+//   npx http4 proxy --upstream http://127.0.0.1:8000 --port 8080 [--budget 200] [--ttl-ms 5000]
 //   npx http4 keygen
 //   npx http4 mint --private-key <b64url-der> [--scope /v1] [--caps read,write] [--ttl 3600]
 // ─────────────────────────────────────────────────────────────────────────────

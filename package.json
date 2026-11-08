@@ -1,28 +1,64 @@
 {
   "name": "http4",
   "version": "0.2.0",
-  "description": "HTTP/4 — agent-native, cost-aware, DoS-resistant evolution of HTTP over QUIC with C11 N-API acceleration, SDK, and HTTP/1.1–3 interoperability.",
+  "description": "HTTP/4 — experimental agent-native, cost-aware semantic layer for HTTP (TLS 1.3/TCP reference carrier, QUIC-aligned varints, HTTP/1.1–3 gateways, optional C11 N-API acceleration).",
   "type": "module",
   "main": "./src/index.js",
   "types": "./types/index.d.ts",
   "bin": {
     "http4": "./bin/http4.js"
   },
+  "files": [
+    "src/",
+    "bin/",
+    "native/h4_core.c",
+    "native/h4_napi.c",
+    "native/h4_core.h",
+    "scripts/build-native.js",
+    "types/",
+    "LICENSE*",
+    "README*"
+  ],
   "exports": {
     ".": {
       "types": "./types/index.d.ts",
       "import": "./src/index.js"
     },
-    "./sdk": "./src/sdk.js",
-    "./adapters": "./src/adapters.js",
-    "./gateway": "./src/gateway.js",
-    "./wire": "./src/wire.js",
-    "./h3-compat": "./src/h3-compat.js",
-    "./privacy-pass": "./src/privacy-pass.js",
-    "./native": "./src/native.js"
+    "./sdk": {
+      "types": "./types/sdk.d.ts",
+      "import": "./src/sdk.js"
+    },
+    "./adapters": {
+      "types": "./types/adapters.d.ts",
+      "import": "./src/adapters.js"
+    },
+    "./gateway": {
+      "types": "./types/gateway.d.ts",
+      "import": "./src/gateway.js"
+    },
+    "./wire": {
+      "types": "./types/wire.d.ts",
+      "import": "./src/wire.js"
+    },
+    "./h3-compat": {
+      "types": "./types/h3-compat.d.ts",
+      "import": "./src/h3-compat.js"
+    },
+    "./privacy-pass": {
+      "types": "./types/privacy-pass.d.ts",
+      "import": "./src/privacy-pass.js"
+    },
+    "./overload-pass": {
+      "types": "./types/privacy-pass.d.ts",
+      "import": "./src/privacy-pass.js"
+    },
+    "./native": {
+      "types": "./types/native.d.ts",
+      "import": "./src/native.js"
+    }
   },
   "scripts": {
-    "postinstall": "node scripts/build-native.js || true",
+    "postinstall": "node scripts/build-native.js",
     "build:native": "node scripts/build-native.js",
     "doctor": "node bin/http4.js doctor",
     "test": "node test/run.js && node test/security-audit.js",
@@ -30,25 +66,35 @@
     "test:san": "node scripts/build-native.js --san",
     "test:security": "node test/security-audit.js",
     "test:purejs": "H4_PURE_JS=1 node test/run.js && H4_PURE_JS=1 node test/security-audit.js",
+    "check:readme": "node scripts/check-readme-numbers.js",
     "bench": "node bench/bench.js",
     "scenario": "node demo.js",
     "example": "node examples/agent-mesh.js",
     "server": "node src/server.js",
     "attack": "node bench/attack-sim.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wisoqu/http-4.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wisoqu/http-4/issues"
+  },
+  "homepage": "https://github.com/wisoqu/http-4#readme",
+  "author": "wisoqu",
   "keywords": [
     "http4",
-    "quic",
     "http3",
     "protocol",
     "agents",
+    "rate-limiting",
     "ddos",
     "capabilities",
     "macaroons",
-    "privacy-pass",
+    "overload-pass",
     "napi"
   ],
-  "license": "CC-BY-4.0 OR MIT",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   }

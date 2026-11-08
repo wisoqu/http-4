@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Zero-dependency builder & ASan/UBSan runner for the H4 C11 / Node-API accelerator.
 //
-//   node scripts/build-native.js         # build native/bin/h4_native.node
-//   node scripts/build-native.js --san   # run C11 suite under ASan + UBSan
+//   node scripts/build-native.js              # build native/bin/h4_native.node (graceful fallback)
+//   H4_SKIP_NATIVE=1 npm install              # skip native compilation and use pure-JS fallback
+//   node scripts/build-native.js --san        # run C11 suite under ASan + UBSan
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,6 +12,11 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function isSkipRequested() {
+  const v = process.env.H4_SKIP_NATIVE ?? process.env.npm_config_h4_skip_native ?? '';
+  return v === '1' || v.toLowerCase() === 'true';
+}
 
 function findCompiler() {
   for (const cc of [process.env.CC, 'gcc', 'clang', 'cc'].filter(Boolean)) {
@@ -38,14 +44,17 @@ function findNodeInclude() {
 }
 
 export function buildNative({ quiet = false } = {}) {
+  if (isSkipRequested()) {
+    if (!quiet) console.log('[h4-native] H4_SKIP_NATIVE=1 — skipping native build, using pure-JS fallback.');
+    return null;
+  }
   const cc = findCompiler();
   const nodeInc = findNodeInclude();
   if (!cc || !nodeInc) {
-    if (!quiet) console.log('[h4-native] C compiler or node_api.h not found — using pure JS fallback.');
+    if (!quiet) console.log('[h4-native] C compiler or node_api.h not found — using pure-JS fallback.');
     return null;
   }
   const outDir = path.join(root, 'native', 'bin');
-  fs.mkdirSync(outDir, { recursive: true });
   const outPath = path.join(outDir, 'h4_native.node');
 
   const flags = [
@@ -59,12 +68,18 @@ export function buildNative({ quiet = false } = {}) {
     flags.push('-shared');
   }
 
-  execFileSync(cc, [
-    ...flags,
-    path.join(root, 'native', 'h4_core.c'),
-    path.join(root, 'native', 'h4_napi.c'),
-    '-o', outPath,
-  ], { stdio: quiet ? 'pipe' : 'inherit' });
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+    execFileSync(cc, [
+      ...flags,
+      path.join(root, 'native', 'h4_core.c'),
+      path.join(root, 'native', 'h4_napi.c'),
+      '-o', outPath,
+    ], { stdio: 'pipe' });
+  } catch {
+    if (!quiet) console.log('[h4-native] native build failed — using pure-JS fallback.');
+    return null;
+  }
 
   if (!quiet) {
     console.log(`[h4-native] built ${path.relative(root, outPath)} (${cc}, N-API v8)`);
