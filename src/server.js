@@ -342,8 +342,9 @@ export class H4Server {
       this.metrics.cacheHits++;
       this.metrics.savedByCacheMs += cached.computeMs ?? 0;
     } else {
-      const route = this._findRoute(lookupMethod, pathname);
-      if (!route) return this._reject(REJECT.MALFORMED, 'no route');
+      const matched = this._matchRoute(lookupMethod, pathname);
+      if (!matched) return this._reject(REJECT.MALFORMED, 'no route');
+      const { fn: route, params } = matched;
 
       const deadlineMs = intent.deadlineMs > 0 ? intent.deadlineMs : 0;
       const run = async () => {
@@ -352,7 +353,7 @@ export class H4Server {
         try {
           let out = await Promise.resolve(route({
             path: pathname, rawPath, query, method, headers: h, body: req.body,
-            intent, cost, identity, now, remainingMs: deadlineMs || 30_000,
+            params, intent, cost, identity, now, remainingMs: deadlineMs || 30_000,
           }));
           // If an async-generator route is invoked via unary handle(), collect chunks cleanly
           if (isAsyncIterable(out) || isAsyncIterable(out?.stream)) {
@@ -488,12 +489,13 @@ export class H4Server {
       subject, net, costClass, limit, predicted, advertised,
     } = adm.ctx;
 
-    const route = this._findRoute(method, pathname);
-    if (!route) {
+    const matched = this._matchRoute(method, pathname);
+    if (!matched) {
       const rej = this._reject(REJECT.MALFORMED, 'no route');
       for (const f of rej.frames) onFrame(f);
       return rej;
     }
+    const { fn: route, params } = matched;
 
     const ac = new AbortController();
     let timer = null;
@@ -522,7 +524,7 @@ export class H4Server {
     try {
       const out = await route({
         path: pathname, rawPath, query, method, headers: h, body: req.body,
-        intent, cost, identity, now, signal: ac.signal,
+        params, intent, cost, identity, now, signal: ac.signal,
         remainingMs: intent.deadlineMs || 30_000,
       });
 
@@ -692,9 +694,68 @@ export class H4Server {
   }
 
   _findRoute(method, pathname) {
+    return this._matchRoute(method, pathname)?.fn ?? null;
+  }
+
+  /**
+   * O(1) exact match with O(segments) ReDoS-free `:param` and `*` wildcard fallback.
+   */
+  _matchRoute(method, pathname) {
+    const emptyParams = Object.create(null);
     const specific = `${method} ${pathname}`;
-    if (Object.hasOwn(this.routes, specific)) return this.routes[specific];
-    if (Object.hasOwn(this.routes, pathname)) return this.routes[pathname];
+    if (Object.hasOwn(this.routes, specific)) return { fn: this.routes[specific], params: emptyParams };
+    if (Object.hasOwn(this.routes, pathname)) return { fn: this.routes[pathname], params: emptyParams };
+    const anySpecific = `* ${pathname}`;
+    if (Object.hasOwn(this.routes, anySpecific)) return { fn: this.routes[anySpecific], params: emptyParams };
+
+    const pathSegs = pathname.split('/');
+    for (const key of Object.keys(this.routes)) {
+      if (!key.includes(':') && !key.includes('*')) continue;
+      let rMethod = '*';
+      let rPattern = key;
+      const sp = key.indexOf(' ');
+      if (sp !== -1) {
+        rMethod = key.slice(0, sp);
+        rPattern = key.slice(sp + 1);
+      }
+      if (rMethod !== '*' && rMethod !== 'ANY' && rMethod !== method) continue;
+      if (rPattern === '*' || rPattern === '/*') {
+        const params = Object.create(null);
+        params['*'] = pathname;
+        return { fn: this.routes[key], params };
+      }
+
+      const patSegs = rPattern.split('/');
+      const params = Object.create(null);
+      let ok = true;
+      for (let i = 0; i < patSegs.length; i++) {
+        const ps = patSegs[i];
+        if (ps === '*') {
+          params['*'] = '/' + pathSegs.slice(i).join('/');
+          return { fn: this.routes[key], params };
+        }
+        if (i >= pathSegs.length) { ok = false; break; }
+        if (ps.charCodeAt(0) === 58 && ps.length > 1) {
+          try {
+            params[ps.slice(1)] = decodeURIComponent(pathSegs[i]);
+          } catch {
+            params[ps.slice(1)] = pathSegs[i];
+          }
+        } else if (ps !== pathSegs[i]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok && patSegs.length === pathSegs.length) {
+        return { fn: this.routes[key], params };
+      }
+    }
+
+    if (Object.hasOwn(this.routes, '*')) {
+      const params = Object.create(null);
+      params['*'] = pathname;
+      return { fn: this.routes['*'], params };
+    }
     return null;
   }
 

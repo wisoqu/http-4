@@ -9,8 +9,13 @@
 //     existing WinterCG `(Request) => Promise<Response>` handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { extractH4Request, unpackH4Response } from './gateway.js';
+import { extractH4Request, unpackH4Response, createGateway } from './gateway.js';
 import { F, REJECT, MODE, CACHE, iterFrames, decodeReject, decodeHeadersFrame, decodeResult } from './frames.js';
+import { H4Server } from './server.js';
+import { KeyRegistry } from './identity.js';
+import { Limiter } from './limits.js';
+import { H4Cache } from './cache.js';
+import { createServer as createWireServer } from './wire.js';
 
 const REJECT_STATUS = {
   [REJECT.RATE_LIMITED]: 429,
@@ -255,5 +260,175 @@ export function wrapFetchHandler(fetchHandler, { cost = 2, ttlMs = 0 } = {}) {
       cost: Number(resp.headers.get('h4-cost') || cost),
       ttlMs,
     };
+  };
+}
+
+/**
+ * 1-line zero-boilerplate Express / Connect / Fastify / Node `http` shield:
+ *   `app.use(h4Shield({ budget: 100, windowMs: 10_000 }))`
+ *
+ * Enforces H4 anti-smuggling, capability tokens, cooperative receipts, `h4-pass`,
+ * C11 Proof-of-Effort, and 0-RTT replay guards WITHOUT consuming the request body
+ * stream — so downstream `express.json()`, `multer`, tRPC, or GraphQL work untouched.
+ */
+export function h4Shield({
+  server = null,
+  budget = 200,
+  windowMs = 10_000,
+  pressure = () => 0,
+  poeMode = 'sha256',
+  passIssuer = null,
+  registry = new KeyRegistry(),
+  requireCap = false,
+  altSvc = null,
+} = {}) {
+  const h4 = server ?? new H4Server({
+    registry,
+    requireCap,
+    limiter: new Limiter({ budget, windowMs, pressure, poeMode, passIssuer }),
+  });
+
+  const middleware = function h4ShieldMiddleware(req, res, next) {
+    const method = (req.method ?? 'GET').toUpperCase();
+    const url = req.originalUrl ?? req.url ?? '/';
+    const h4Req = extractH4Request(method, url, req.headers ?? {}, null, req.socket?.remoteAddress ?? 'anon');
+    const adm = h4._admit(h4Req, Date.now());
+
+    if (!adm.ok) {
+      const rej = adm.response.reject;
+      const webRej = buildRejectWebResponse(rej, altSvc, method);
+      res.statusCode = webRej.status;
+      for (const [k, v] of webRej.headers.entries()) res.setHeader(k, v);
+      webRej.arrayBuffer().then((ab) => res.end(Buffer.from(ab)));
+      return;
+    }
+
+    if (altSvc) res.setHeader('alt-svc', altSvc);
+    res.setHeader('ratelimit-remaining', String(adm.ctx.advertised.budgetRemaining));
+    res.setHeader('ratelimit-policy', `${h4.limiter.budget};w=${Math.round(h4.limiter.windowMs / 1000)}`);
+    req.h4 = {
+      admitted: true,
+      identity: adm.ctx.identity,
+      subject: adm.ctx.subject,
+      predictedCost: adm.ctx.predicted,
+      budgetRemaining: adm.ctx.advertised.budgetRemaining,
+    };
+    if (typeof next === 'function') next();
+  };
+
+  middleware.server = h4;
+  return middleware;
+}
+
+/**
+ * 1-line wrapper for Next.js App Router, Cloudflare Workers, Bun, Deno, or Hono:
+ *   `export default { fetch: withH4(myFetchHandler, { budget: 200, defaultTtlMs: 5000 }) }`
+ */
+export function withH4(fetchHandler, {
+  budget = 200,
+  windowMs = 10_000,
+  pressure = () => 0,
+  poeMode = 'sha256',
+  passIssuer = null,
+  defaultTtlMs = 0,
+  maxCacheBytes = 32 * 1024 * 1024,
+  cost = 2,
+  registry = new KeyRegistry(),
+  requireCap = false,
+  altSvc = null,
+} = {}) {
+  const h4 = new H4Server({
+    registry,
+    requireCap,
+    limiter: new Limiter({ budget, windowMs, pressure, poeMode, passIssuer }),
+    cache: new H4Cache({ defaultTtlMs, maxBytes: maxCacheBytes, pressure }),
+    routes: {
+      '*': wrapFetchHandler(fetchHandler, { cost, ttlMs: defaultTtlMs }),
+    },
+  });
+  const handler = toWebHandler(h4, { altSvc });
+  handler.server = h4;
+  return handler;
+}
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length',
+]);
+
+/**
+ * Zero-code Reverse-Proxy Sidecar in front of ANY backend (Python FastAPI, vLLM,
+ * Ollama, Go, Rust, Ruby, Java).
+ *
+ * Gives any existing HTTP server singleflight request coalescing (100 duplicate
+ * agent retries -> 1 upstream call), capability verification, `h4-pass`, and C11 PoE.
+ */
+export function createReverseProxy({
+  upstream,
+  budget = 200,
+  windowMs = 10_000,
+  pressure = () => 0,
+  poeMode = 'sha256',
+  passIssuer = null,
+  defaultTtlMs = 0,
+  requireCap = false,
+  registry = new KeyRegistry(),
+  altSvcPort = null,
+  upstreamFetch = globalThis.fetch,
+} = {}) {
+  if (!upstream) throw new Error('createReverseProxy requires an `upstream` URL (e.g. http://127.0.0.1:8000)');
+  const base = new URL(upstream);
+
+  const h4Server = new H4Server({
+    registry,
+    requireCap,
+    limiter: new Limiter({ budget, windowMs, pressure, poeMode, passIssuer }),
+    cache: new H4Cache({ defaultTtlMs, pressure }),
+    routes: {
+      '*': async (ctx) => {
+        const target = new URL(ctx.rawPath, base);
+        // Prevent open-proxy host escape if rawPath is malformed
+        if (target.origin !== base.origin) {
+          return { status: 400, body: { error: 'invalid upstream path' }, cost: 1 };
+        }
+        const fwdHeaders = new Headers();
+        for (const [k, v] of Object.entries(ctx.headers)) {
+          if (k.startsWith(':') || HOP_BY_HOP_HEADERS.has(k)) continue;
+          try { fwdHeaders.set(k, v); } catch { /* ignore */ }
+        }
+        // Strip spoofable identity headers, then inject verified H4 identity claims
+        fwdHeaders.delete('x-h4-verified-subject');
+        fwdHeaders.delete('x-h4-verified-tenant');
+        fwdHeaders.delete('x-h4-verified-scope');
+        if (ctx.identity) {
+          fwdHeaders.set('x-h4-verified-subject', ctx.identity.subject);
+          fwdHeaders.set('x-h4-verified-tenant', ctx.identity.tenant || '');
+          fwdHeaders.set('x-h4-verified-scope', ctx.identity.scope);
+        }
+
+        const init = { method: ctx.method, headers: fwdHeaders, redirect: 'manual' };
+        if (ctx.method !== 'GET' && ctx.method !== 'HEAD' && ctx.body) {
+          init.body = ctx.body;
+        }
+        const resp = await upstreamFetch(target, init);
+        const ab = await resp.arrayBuffer();
+        return {
+          status: resp.status,
+          type: resp.headers.get('content-type') ?? 'application/json',
+          body: Buffer.from(ab),
+          cost: Number(resp.headers.get('h4-cost') || 2),
+          ttlMs: resp.status < 500 ? defaultTtlMs : 0,
+        };
+      },
+    },
+  });
+
+  const httpGateway = createGateway({ handler: h4Server, altSvcPort });
+  return {
+    h4Server,
+    httpGateway,
+    createTlsServer(tlsOptions) {
+      return createWireServer({ handler: h4Server, tlsOptions });
+    },
   };
 }

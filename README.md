@@ -1,118 +1,126 @@
-# HTTP/4 (`v0.2.0`) — Reference Implementation, C11 Engine & SDK
+# HTTP/4 (`http4` v0.2.0)
 
-> Агент-нативный, экономически осознанный и устойчивый к L7-атакам протокол поколения HTTP/4.  
-> Спецификация: **[spec/http4.md](spec/http4.md)** · Модель безопасности: **[SECURITY.md](SECURITY.md)**
+> **[🇷🇺 Читать на русском (README.ru.md)](README.ru.md)** · **[Руководство по интеграции (docs/INTEGRATION.md)](docs/INTEGRATION.md)** · **[Protocol Spec](spec/http4.md)** · **[Security Model](SECURITY.md)**
 
-HTTP/4 меняет три фундаментальные вещи по сравнению с HTTP/1.1–3:
-1. **Намерение и цена на проводе** (`INTENT`, `COST`, `RESULT`): запрос объявляет потолок стоимости, дедлайн и идемпотентность; ответ возвращает фактическую цену и ошибку предсказания (`cost_asym`).
-2. **Офлайн-делегация прав (Macaroon Capabilities)**: один Ed25519 на корневой грант (кэшируется) + цепочка сужающих `HMAC-SHA256-128` звеньев за микросекунды без походов в auth-сервер.
-3. **Кооперативная и асимметричная защита от перегрузки**: клиент сам ведёт бюджет по подписанным квитанциям (`h4-rl`), использует одноразовые крипто-пропуска без сжигания батареи (`h4-pass`), либо платит вычислительным Proof-of-Effort (`SHA-256` или кэш-тяжёлый 4 KB `MemHard`), ускоренным нативным **C11 Node-API движком**.
+[![CI & Sanitizers](https://github.com/wisoqu/http-4/actions/workflows/ci.yml/badge.svg)](https://github.com/wisoqu/http-4/actions/workflows/ci.yml)
+
+**An agent-native, cost-aware, L7-DDoS-resistant evolution of HTTP** — with a **C11 Node-API accelerator**, **zero external dependencies**, and **1-command / 1-line drop-in integration** for existing HTTP/1.1, HTTP/2, HTTP/3, Python/FastAPI, Go, Express, and Edge apps.
 
 ---
 
-## Быстрый старт (0 внешних npm-зависимостей, Node.js ≥ 20)
+## Why This Exists (What Broke Between Humans and AI Agents)
+
+HTTP/1.1–3 were designed for a human clicking links at ~1 req/s. Autonomous AI agents broke three assumptions simultaneously:
+1. **Retry storms burn GPU compute, not bytes:** 50 agents retrying the same slow LLM/tool call trigger 50 duplicate `$0.05` model runs.
+2. **Sub-agent fan-out breaks OAuth/JWT:** an orchestrator spawning 8 narrow sub-agents either leaks its master API key or hammers an auth server on every hop.
+3. **IP-based rate limits cause massive collateral damage:** 2,500 cloud/CGNAT agents behind 8 shared egress IPs get blanket-429'd together (`88%` false-positive drop rate in our benchmark).
+
+`http4` fixes all three at the protocol & edge layer — **without requiring you to rewrite your backend**:
+- **Singleflight Coalescing + Cost Ceilings (`INTENT` / `COST` / `RESULT`):** 100 identical in-flight requests execute **once**; callers declare `costCeiling` & `deadlineMs`; mid-stream `F.CANCEL` halts generation in `< 1 ms` and refunds unused budget.
+- **Offline Macaroon Capabilities (`CAP`):** 1 Ed25519 verify per root grant (cached), then `~2 µs` offline `HMAC-SHA256-128` narrowing per sub-agent hop (`scope`, `caps`, `tenant`, `expiresAt`). Privilege escalation is mathematically impossible.
+- **Client-Cooperative Limits + Priced Effort (`RATE` / `h4-pass` / C11 PoE):** honest clients self-account via signed receipts; overload triggers either zero-CPU single-use `h4-pass` redemption (`~2 µs`) or C11-accelerated `SHA-256` / 4 KB cache-hard `MemHard` Proof-of-Effort (`380 ns` server verify).
+
+---
+
+## Integrate in 60 Seconds (4 Ways — Pick Yours)
+
+Install directly (Node.js ≥ 20, zero runtime npm dependencies; auto-compiles C11 N-API addon if `gcc`/`clang` is present, with seamless pure-JS fallback):
 
 ```bash
-npm run build:native   # сборка C11 N-API ускорителя (автоматически с pure-JS fallback)
-npm test               # 62 инварианта спеки + 15 киберсекьюрити red-team & fuzz тестов
-npm run test:san       # прогон C11 ядра под AddressSanitizer + UndefinedBehaviorSanitizer
-npm run example        # live multi-agent mesh: делегация + стриминг + F.CANCEL
-npm run scenario       # 7 сценариев поверх реального TLS 1.3 (ALPN h4)
-npm run bench          # честные бенчмарки на текущем железе
-npm run attack         # симуляция L7 DDoS (20,000 запросов за общим CGNAT)
+npm install github:wisoqu/http-4
 ```
 
----
+### Option A: Zero-Code Sidecar Proxy (Python FastAPI, vLLM, Ollama, Go, Rust — Any Language)
+Put `http4` in front of **any** existing HTTP backend in 1 command. Duplicate agent retries with `h4-dedup` coalesce into **1 upstream call**, and L7 floods hit C11 Proof-of-Effort before touching your app:
 
-## Интеграция за 5 минут
+```bash
+npx http4 proxy --upstream http://127.0.0.1:8000 --port 8080 --budget 200 --ttl-ms 5000
+```
 
-### 1. Клиентский SDK (`fetch`-совместимый + 1-строчная делегация суб-агентам)
+### Option B: 1 Line for Express / Fastify / Node `http`
+Protects all existing routes without consuming `req` body streams (`express.json()`, `multer`, GraphQL, tRPC keep working untouched):
+
+```js
+import express from 'express';
+import { h4Shield } from 'http4/adapters';
+
+const app = express();
+app.use(h4Shield({ budget: 200, windowMs: 10_000 })); // <- 1 line!
+app.use(express.json());
+app.post('/v1/chat', (req, res) => res.json({ subject: req.h4.subject, ok: true }));
+app.listen(3000);
+```
+
+### Option C: 1 Line for Next.js App Router / Cloudflare Workers / Bun / Deno / Hono
+Wraps any WinterCG `(Request) => Promise<Response>` handler with singleflight coalescing, tenant-isolated caching, 0-RTT `425` protection, and DDoS PoE:
+
+```js
+import { withH4 } from 'http4/adapters';
+
+export default {
+  fetch: withH4(async (req) => Response.json({ ok: true }), {
+    budget: 200,
+    defaultTtlMs: 5_000,
+  }),
+};
+```
+
+### Option D: Multi-Agent SDK (`fetch`-Compatible + 1-Line Offline Delegation & Streaming)
 
 ```js
 import { createH4Fetch, AgentSession, CAPS } from 'http4';
 
-const h4Fetch = createH4Fetch({
-  maxEffortBits: 20, // защита клиента от злонамеренно сложного PoE
-});
-
+const h4Fetch = createH4Fetch({ maxEffortBits: 20 }); // auto-upgrades via Alt-Svc!
 const orchestrator = new AgentSession({ token: rootGrant, h4Fetch, budget: 100 });
 
-// Офлайн-делегация за ~2 µs без обращения к серверу авторизации:
-const researcher = orchestrator.delegate({
+// Spawn a strictly confined sub-agent offline in ~2 µs (0 auth-server round trips):
+const docReader = orchestrator.delegate({
   caps: CAPS.READ,
   scope: '/v1/docs',
   budget: 25,
   delegable: false,
 });
 
-const res = await researcher.fetch('h4://api.example.com:8443/v1/docs/spec');
-console.log(await res.json(), 'cost=', res.h4.result.costActual);
+const res = await docReader.fetch('https://api.example.com/v1/docs/spec');
 
-// Живой стриминг токенов с мгновенной отменой генерации на сервере (`F.CANCEL`):
+// Live token streaming with instant server-side halt & budget refund on abort:
 const ac = new AbortController();
 for await (const chunk of orchestrator.stream('h4://api.example.com:8443/v1/llm/stream', { signal: ac.signal })) {
-  process.stdout.write(chunk);
-  if (doneReading) ac.abort(); // останавливает LLM на сервере и возвращает неизрасходованный бюджет
+  if (enoughContext(chunk)) ac.abort(); // sends F.CANCEL -> stops server LLM immediately
 }
 ```
 
-### 2. Универсальные адаптеры (Cloudflare Workers / Bun / Next.js / Hono / Express)
+---
 
-```js
-import { H4Server, toWebHandler, toNodeMiddleware } from 'http4';
+## Reproducible Benchmarks (2 vCPU Xeon · Node v22 · C11 N-API)
 
-const h4 = new H4Server({
-  routes: {
-    'GET /v1/items': async () => ({ status: 200, body: { items: [1, 2, 3] }, cost: 1, ttlMs: 5000 }),
-    'SUB /v1/stream': async function* ({ signal }) {
-      for (let i = 0; i < 10 && !signal?.aborted; i++) yield { token: i };
-    },
-  },
-});
+Every number below is measured on-box via `npm run bench` and `npm run attack`:
 
-// Edge / WinterCG (Cloudflare Workers, Bun, Deno, Next.js App Router):
-export default { fetch: toWebHandler(h4) };
+| Metric | Measured Result |
+|---|---|
+| Wire size: simple `GET` / 8-header agent call | **12 B** (`6.0×` smaller than H1) / **48 B** (`4.2×` smaller than H1) |
+| Full binary request parse (`79 B` flight) | **667 ns** (`1.50 M ops/s`) |
+| End-to-end `H4Server` serve (sync cache path) | **17.6 µs** (`56,900 req/s` per core) |
+| Reject hostile / rate-limited request | **7.3 µs** (`2.4×` cheaper than serving) |
+| PoE solver rate (`C11 N-API` vs `Pure JS`) | **2.99 M hashes/s** vs `0.49 M hashes/s` (**6.1× faster**) |
+| Defender PoE verify (`SHA-256` / `4 KB MemHard`) | **380 ns** (`2.63 M/s`) / **2.94 µs** (`340 k/s`) — O(1) at any difficulty |
+| Shared-CGNAT L7 Flood (`20,000` reqs, 500 attackers) | Honest agents served: **12.0% → 100.0%** · Attackers: **12.0% → 2.3%** |
 
-// Node.js / Express / Connect / Fastify middleware:
-// app.use(toNodeMiddleware(h4, { altSvc: 'h4=":8443"; ma=86400' }));
+---
+
+## Verification & Sanitizer Suite
+
+```bash
+npx http4 doctor                         # check runtime & C11 N-API hash rate
+npm test                                 # 62 spec invariants + 17 red-team & differential fuzz suites
+npm run test:san                         # GCC C11 AddressSanitizer + UndefinedBehaviorSanitizer (100k fuzz cases)
+npm run test:purejs                      # 100% pure-JS fallback parity check
+node examples/reverse-proxy-sidecar.js   # 50 concurrent retries -> 1 upstream call demo
+node examples/agent-mesh.js              # multi-agent delegation + live F.CANCEL streaming demo
 ```
 
 ---
 
-## Архитектура репозитория
+## License
 
-| Файл | Назначение |
-|---|---|
-| `native/h4_core.c`, `native/h4_napi.c` | Нативное C11 / Node-API v8 ядро (`SHA-256 PoE`, 4 KB `MemHard`, `HMAC`, цепочки capability, сканер кадров) |
-| `native/test_san.c` | Автономный C11 тест + 100,000 итераций фаззинга под `ASan + UBSan` |
-| `src/native.js` | Автоматический загрузчик C11 аддона с прозрачным pure-JS fallback (`H4_PURE_JS=1`) |
-| `src/varint.js`, `src/headers.js`, `src/frames.js` | QUIC-varint (62 бита + zigzag), статический словарь заголовков с защитой от CRLF/NUL, 14 типов кадров |
-| `src/identity.js` | Macaroon capability-токены с доменным разделением, офлайн-сужением и O(1) отзывом (`revokeGrant`) |
-| `src/limits.js`, `src/privacy-pass.js` | Кооперативные квитанции, одноразовые пропуска `h4-pass` (0% CPU клиента), `SHA-256` и `MemHard` PoE |
-| `src/cache.js`, `src/server.js`, `src/client.js` | Tenant-изолированный LRU, singleflight coalescing, 0-RTT защита (`425`), `handleStream` + возврат бюджета |
-| `src/wire.js` | Мультиплексированный TLS 1.3 транспорт (`ALPN h4`, защита от ALPACA, Slowloris и Rapid-Reset, `F.CANCEL`) |
-| `src/gateway.js`, `src/h3-compat.js` | HTTP/1.1 & HTTP/2 ↔ H4 edge-гейтвей (включая SSE) + RFC 9114 GREASE-safe HTTP/3 extension кадры (`0x42..0x4d`) |
-| `src/sdk.js`, `src/adapters.js`, `types/index.d.ts` | Web `fetch` SDK (`Alt-Svc` авто-апгрейд), `AgentSession`, адаптеры для Web/Node фреймворков и полные TypeScript типы |
-| `SECURITY.md`, `test/security-audit.js` | Формальная модель угроз, вынесенные инфраструктурные границы и red-team / differential-fuzz набор |
-
----
-
-## Ключевые измеренные показатели (2 vCPU Xeon · Node v22 · C11 N-API)
-
-Все цифры воспроизводятся локально командой `npm run bench`:
-
-| Показатель | Результат |
-|---|---|
-| Простой `GET` / агентский вызов на проводе | **12 B** (6.0× меньше HTTP/1.1) / **48 B** (4.2× меньше HTTP/1.1) |
-| Парсинг полного бинарного запроса (79 B) | **667 ns** (`1.50 M ops/s`) |
-| Обслужить запрос (sync cache path) | **17.6 µs** (`56,900 req/s` на 1 ядро) |
-| Отклонить атакующий запрос | **7.3 µs** (`2.4×` дешевле обслуживания) |
-| Скорость решения PoE (`C11 N-API` vs `Pure JS`) | **2.99 M hashes/s** vs `0.49 M hashes/s` (**6.1× быстрее**) |
-| Проверка PoE защитником (`SHA-256` / `4 KB MemHard`) | **380 ns** (`2.63 M/s`) / **2.94 µs** (`340 k/s`) — O(1) при любой сложности |
-| L7 DDoS за общим CGNAT (`20,000` запросов) | Честные агенты: **12.0% → 100.0%**, атакующие: **12.0% → 2.3%** |
-
----
-
-## Лицензия
-
-Код — MIT (`LICENSE`), спецификация — CC BY 4.0 (`LICENSE-spec`). SPDX: `CC-BY-4.0 OR MIT`.
+Code: MIT (`LICENSE`) · Specification: CC BY 4.0 (`LICENSE-spec`). SPDX: `CC-BY-4.0 OR MIT`.

@@ -22,7 +22,7 @@ import {
   createGateway,
   encodeH3CompatFlight, decodeH3CompatFlight, isGreaseH3FrameType, H4_TO_H3_TYPE,
   createH4Fetch, AgentSession,
-  toWebHandler, toNodeMiddleware, wrapFetchHandler,
+  toWebHandler, toNodeMiddleware, wrapFetchHandler, h4Shield, withH4, createReverseProxy,
   nativeBinding, isNativeLoaded,
 } from '../src/index.js';
 
@@ -503,6 +503,134 @@ await test('toWebHandler, toNodeMiddleware, wrapFetchHandler, createH4Fetch (Alt
     httpSrv.close();
     wireSrv.close();
   }
+});
+
+console.log('\n── 8. Zero-Barrier Integration: :param Routes, h4Shield, withH4, ReverseProxy & CLI');
+
+await test('dynamic :param and * wildcard routes match safely without ReDoS', async () => {
+  const s = new H4Server({
+    routes: {
+      'GET /v1/orgs/:orgId/agents/:agentId': ({ params }) => ({
+        status: 200,
+        body: { orgId: params.orgId, agentId: params.agentId },
+      }),
+      'POST /v1/proxy/*': ({ params }) => ({
+        status: 200,
+        body: { rest: params['*'] },
+      }),
+    },
+  });
+  const f = createH4Fetch({ server: s });
+  const r1 = await f('h4://local/v1/orgs/acme%20corp/agents/bot-7');
+  assert.equal(r1.status, 200);
+  assert.deepEqual(await r1.json(), { orgId: 'acme corp', agentId: 'bot-7' });
+
+  const r2 = await f('h4://local/v1/proxy/chat/completions', { method: 'POST', body: '{}' });
+  assert.equal(r2.status, 200);
+  assert.deepEqual(await r2.json(), { rest: '/chat/completions' });
+});
+
+await test('h4Shield protects Express-style routes without consuming req body stream; withH4 & createReverseProxy coalesce storms', async () => {
+  // 8a. h4Shield leaves POST body stream intact for downstream JSON parsers
+  const shield = h4Shield({ budget: 50, windowMs: 10_000 });
+  const appSrv = http.createServer((req, res) => {
+    shield(req, res, async () => {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ got: parsed.hello, subject: req.h4.subject }));
+    });
+  });
+  await new Promise((r) => appSrv.listen(0, '127.0.0.1', r));
+  const appPort = appSrv.address().port;
+
+  // 8b. createReverseProxy in front of appSrv: coalesces 20 duplicate requests -> 1 upstream hit & strips spoofed headers
+  let upstreamCount = 0;
+  const upstreamSrv = http.createServer(async (req, res) => {
+    upstreamCount++;
+    await new Promise((r) => setTimeout(r, 20));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      calls: upstreamCount,
+      spoofedSubject: req.headers['x-h4-verified-subject'] ?? null,
+    }));
+  });
+  await new Promise((r) => upstreamSrv.listen(0, '127.0.0.1', r));
+  const upPort = upstreamSrv.address().port;
+
+  const { httpGateway } = createReverseProxy({
+    upstream: `http://127.0.0.1:${upPort}`,
+    defaultTtlMs: 2_000,
+  });
+  await new Promise((r) => httpGateway.listen(0, '127.0.0.1', r));
+  const proxyPort = httpGateway.address().port;
+
+  try {
+    const shieldRes = await fetch(`http://127.0.0.1:${appPort}/v1/echo`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hello: 'express' }),
+    });
+    assert.equal(shieldRes.status, 200);
+    const shieldJson = await shieldRes.json();
+    assert.equal(shieldJson.got, 'express');
+    assert.equal(typeof shieldJson.subject, 'string');
+
+    // 20 concurrent calls with spoofed x-h4-verified-subject -> coalesced to 1 upstream call and spoof stripped!
+    const burst = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        fetch(`http://127.0.0.1:${proxyPort}/v1/infer`, {
+          method: 'POST',
+          headers: {
+            'h4-dedup': 'same-prompt',
+            'x-h4-verified-subject': 'spoofed-admin',
+          },
+          body: '{"p":"hi"}',
+        }).then((r) => r.json())
+      )
+    );
+    assert.equal(upstreamCount, 1);
+    assert.equal(burst[0].spoofedSubject, null, 'spoofed x-h4-verified-* header must be stripped');
+
+    // 8c. withH4 1-line Web handler wrapper
+    let webRuns = 0;
+    const wrapped = withH4(async () => {
+      webRuns++;
+      return Response.json({ runs: webRuns });
+    }, { defaultTtlMs: 5_000 });
+    await wrapped(new Request('https://worker.local/cached'));
+    await wrapped(new Request('https://worker.local/cached'));
+    assert.equal(webRuns, 1);
+  } finally {
+    httpGateway.close();
+    upstreamSrv.close();
+    appSrv.close();
+  }
+});
+
+await test('CLI (`bin/http4.js`) doctor, keygen, and mint execute cleanly end-to-end', () => {
+  const cliPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../bin/http4.js');
+  const docOut = execFileSync(process.execPath, [cliPath, 'doctor'], { encoding: 'utf8' });
+  assert.match(docOut, /status\s+READY/);
+
+  const keyJson = JSON.parse(execFileSync(process.execPath, [cliPath, 'keygen'], { encoding: 'utf8' }));
+  const mintedB64 = execFileSync(process.execPath, [
+    cliPath, 'mint',
+    '--private-key', keyJson.privateKeyPkcs8B64,
+    '--scope', '/v1/data',
+    '--caps', 'read,delegate',
+  ], { encoding: 'utf8' }).trim();
+
+  const pubKey = crypto.createPublicKey({
+    key: Buffer.from(keyJson.publicKeySpkiB64, 'base64url'),
+    format: 'der',
+    type: 'spki',
+  });
+  const reg = new KeyRegistry().add(1, pubKey);
+  const v = verify(Buffer.from(mintedB64, 'base64url'), reg, { required: CAPS.READ });
+  assert.equal(v.ok, true);
+  assert.equal(v.scope, '/v1/data');
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
