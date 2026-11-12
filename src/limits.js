@@ -14,6 +14,17 @@ import { nativeBinding } from './native.js';
 
 export const CLASS_WEIGHT = { [CLASS.CHEAP]: 1, [CLASS.NORMAL]: 5, [CLASS.EXPENSIVE]: 60 };
 
+// Bounded-memory ceilings for the server-side state tables. Every key in these
+// tables is reachable by an untrusted caller, so each one needs a hard cap *and*
+// an eviction policy that cannot be driven into O(n) behaviour per request.
+export const MAX_SUBJECT_ENTRIES = 200_000;
+export const MAX_NET_ENTRIES = 50_000;
+export const MAX_POE_ENTRIES = 50_000;
+// A table sweep is O(n), so it is rate-limited to at most one per window; between
+// sweeps overflow is shed in small O(1) batches from the oldest end (JS Maps keep
+// insertion order).
+const SWEEP_BATCH = 256;
+
 const RECEIPT_DOMAIN = Buffer.from('H4-RL-RECEIPT-v1|');
 const CHAL_DOMAIN = Buffer.from('H4-POE-CHAL-v1|');
 const MH1_DOMAIN = Buffer.from('H4-MH1|');
@@ -242,6 +253,8 @@ export class Limiter {
     this.netEntries = new Map(); // address/grant → { window, spent }
     this.entries = new Map();    // subject → { window, spent, blockedUntil, lastNonce, punish }
     this.usedPoe = new Map();    // `${subject}:${poeWin}:${nonce}` → poeWin (anti-replay)
+    this._sweepWindow = null;    // last window `entries` was swept in
+    this._netSweepWindow = null; // last window `netEntries` was swept in
     this.stats = {
       receiptsOk: 0, receiptsMissing: 0, receiptsForged: 0,
       rejected: 0, poeServed: 0, poeRedeemed: 0, passRedeemed: 0, hmacOps: 0,
@@ -253,7 +266,7 @@ export class Limiter {
     let e = this.entries.get(subject);
     if (!e) {
       e = { window, spent: 0, blockedUntil: 0, lastNonce: -1, punish: 0 };
-      if (this.entries.size >= 200000) this._gc(now);
+      if (this.entries.size >= MAX_SUBJECT_ENTRIES) this._gc(now);
       this.entries.set(subject, e);
     } else if (e.window !== window) {
       e.window = window;
@@ -262,22 +275,43 @@ export class Limiter {
     return e;
   }
 
+  /**
+   * Bounded reclamation for `entries`.
+   *
+   * The previous implementation ran a full O(n) sweep of the map on *every*
+   * insertion once the table was saturated. Because the subject key is derived
+   * (in part) from caller-supplied data, one client could saturate the table and
+   * then force a 200k-entry scan per request — measured at ~3 000x slowdown.
+   *
+   * Now: at most one sweep per window, plus a small O(SWEEP_BATCH) shed of the
+   * oldest keys for the insertions in between.
+   */
   _gc(now) {
     const minWin = Math.floor(now / this.windowMs) - 1;
-    for (const [k, v] of this.entries) {
-      if (v.window < minWin) this.entries.delete(k);
+    if (this._sweepWindow !== minWin) {
+      this._sweepWindow = minWin;
+      for (const [k, v] of this.entries) {
+        if (v.window < minWin) this.entries.delete(k);
+      }
     }
-    if (this.entries.size >= 200000) {
-      this.entries.delete(this.entries.keys().next().value);
+    for (let i = 0; i < SWEEP_BATCH && this.entries.size >= MAX_SUBJECT_ENTRIES; i++) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
     }
   }
 
   _gcNet(window) {
-    for (const [k, v] of this.netEntries) {
-      if (v.window < window - 1) this.netEntries.delete(k);
+    if (this._netSweepWindow !== window) {
+      this._netSweepWindow = window;
+      for (const [k, v] of this.netEntries) {
+        if (v.window < window - 1) this.netEntries.delete(k);
+      }
     }
-    if (this.netEntries.size >= 50000) {
-      this.netEntries.delete(this.netEntries.keys().next().value);
+    for (let i = 0; i < SWEEP_BATCH && this.netEntries.size >= MAX_NET_ENTRIES; i++) {
+      const oldest = this.netEntries.keys().next().value;
+      if (oldest === undefined) break;
+      this.netEntries.delete(oldest);
     }
   }
 
@@ -432,11 +466,15 @@ export class Limiter {
     if (this.usedPoe.has(replayKey)) return null;
     if (!checkPoE(challenge, nonce, difficulty, mode)) return null;
 
-    if (this.usedPoe.size >= 50000) {
+    // The replay table is the *only* thing making a PoE solution single-use.
+    // Evicting an entry that still belongs to a live window would silently
+    // re-arm that nonce, so we sweep expired windows and then FAIL CLOSED
+    // rather than forget a live one.
+    if (this.usedPoe.size >= MAX_POE_ENTRIES) {
       for (const [k, w] of this.usedPoe) {
         if (w < poeWindow - 1) this.usedPoe.delete(k);
       }
-      if (this.usedPoe.size >= 50000) this.usedPoe.delete(this.usedPoe.keys().next().value);
+      if (this.usedPoe.size >= MAX_POE_ENTRIES) return null;
     }
     this.usedPoe.set(replayKey, poeWindow);
 

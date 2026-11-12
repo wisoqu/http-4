@@ -96,27 +96,42 @@ export class PassIssuer {
         return { ok: false, why: 'expired-pass' };
       }
 
-      this.#pruneExpired(now);
       const idHex = Buffer.from(passId).toString('hex');
       if (this.redeemed.has(idHex)) {
         return { ok: false, why: 'replayed-pass' };
       }
+      // Single-use must mean single-use. The double-spend table is the only
+      // record that a pass was already spent, so it must never drop an entry
+      // whose TTL is still live — otherwise a spent (but unexpired) pass becomes
+      // replayable again. Sweep expired entries, then fail closed if still full.
       if (this.redeemed.size >= this.maxRedeemed) {
-        this.redeemed.delete(this.redeemed.keys().next().value);
+        this.#pruneExpired(now, true);
+        if (this.redeemed.size >= this.maxRedeemed) {
+          return { ok: false, why: 'pass-table-full' };
+        }
       }
       this.redeemed.set(idHex, expiresAtSec * 1000);
+      this.#pruneExpired(now);
       return { ok: true, passId: idHex, expiresAt: expiresAtSec };
     } catch {
       return { ok: false, why: 'corrupt-pass' };
     }
   }
 
-  #pruneExpired(now) {
-    if (this.redeemed.size < 4096) return;
+  /**
+   * Lazily drop entries whose TTL has elapsed.
+   *
+   * The incremental pass (`full !== true`) only inspects a small batch so the hot
+   * path stays O(1). `full` performs a complete sweep and is used before we would
+   * otherwise be forced to evict a still-live entry.
+   */
+  #pruneExpired(now, full = false) {
+    if (this.redeemed.size < 4096 && !full) return;
+    const limit = full ? this.redeemed.size : 64;
     let checked = 0;
     for (const [k, expMs] of this.redeemed) {
       if (expMs < now) this.redeemed.delete(k);
-      if (++checked >= 64) break;
+      if (++checked >= limit) break;
     }
   }
 }

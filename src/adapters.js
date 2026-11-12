@@ -47,7 +47,15 @@ export function toWebHandler(h4Server, { altSvc = null, maxBodyBytes = 4 * 1024 
     const u = new URL(request.url, 'https://localhost');
     const method = (request.method || 'GET').toUpperCase();
     const rawHeaders = Object.fromEntries(request.headers.entries());
-    const peer = envOrCtx?.remoteAddress ?? rawHeaders['cf-connecting-ip'] ?? 'web-edge';
+    // Peer attribution MUST come from the platform, never from a request header.
+    // `rawHeaders` is attacker-controlled: reading `cf-connecting-ip` off it let a
+    // caller pick (and rotate) its own aggregate quota bucket. `request.cf` is
+    // injected by the Workers runtime and is not client-writable; `remoteAddress`
+    // is the explicit operator-supplied override (SECURITY.md §4.3).
+    const peer = envOrCtx?.remoteAddress
+      ?? request?.cf?.connectingIp
+      ?? envOrCtx?.cf?.connectingIp
+      ?? 'web-edge';
 
     let bodyBuf = Buffer.alloc(0);
     if (method !== 'GET' && method !== 'HEAD' && request.body) {

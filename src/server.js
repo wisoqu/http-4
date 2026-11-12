@@ -180,7 +180,7 @@ export class H4Server {
     const instanceId = h['h4-agent-instance'] || '';
     const subject = identity
       ? crypto.createHash('sha256').update(`${identity.subject}|${instanceId}`).digest('hex').slice(0, 16)
-      : this._subjectFromRequest(peerNorm, h);
+      : this._subjectFromRequest(peerNorm);
     const net = identity ? identity.grant : peerNorm;
     const netAllowance = identity
       ? this.limiter.budget * (1 + this.limiter.identityBonus) * Math.max(1, Math.min(identity.maxSubs || 1, 4096))
@@ -768,10 +768,22 @@ export class H4Server {
     };
   }
 
-  _subjectFromRequest(peerNorm, h) {
-    const inst = h['h4-agent-instance'] || h['h4-agent'] || '';
+  /**
+   * Quota subject for *unauthenticated* callers.
+   *
+   * This used to hash a caller-supplied `h4-agent-instance` header into the key,
+   * which meant anyone could mint a fresh 200-unit bucket per request simply by
+   * randomising one header (verified: 4x the documented budget, plus unbounded
+   * growth of `Limiter.entries`). Anonymous callers have nothing to identify
+   * them but their address, so that is the only input we may trust here.
+   *
+   * Callers who need a private quota must present a verified capability; the
+   * instance id is then only allowed to partition an *already authenticated*
+   * identity (see `_admit`).
+   */
+  _subjectFromRequest(peerNorm) {
     const net = peerNorm ?? 'anon';
-    return crypto.createHash('sha256').update(`${inst}|${net}`).digest('hex').slice(0, 16);
+    return crypto.createHash('sha256').update(`anon|${net}`).digest('hex').slice(0, 16);
   }
 
   _classify(path, method, intent, cost) {
